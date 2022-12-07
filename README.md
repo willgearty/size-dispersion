@@ -2,7 +2,11 @@ This repository contains the required R code and data files to produce all of th
 ‘Human impacts indirectly drive mammal body size homogenization among communities’
 William Gearty, Lawrence H. Uricchio, and S. Kathleen Lyons
 
-Before running these R scripts, we suggest that you download this folder and set it as your R working directory. Required data files should then load when called in each script, and plot files will save within the same folder. Note that some data must be downloaded separately before the analyses can be performed (see below).
+## Before running the code
+Before running this R script, we suggest that you download this folder and set it as your R working directory. Required data files should then load when called in each script, and plot files will save within the same folder. Note that some data must be downloaded separately before the analyses can be performed ([see below](#data)).
+
+## Running the code
+Run `mammal_variance.R` to perform all analyses and produce all plots from the manuscript. Note that the analyses can take a few days to run completely.
 
 ## Required R packages
 Unless otherwise stated, the following packages can all be installed from CRAN:
