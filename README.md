@@ -1,5 +1,5 @@
-This repository contains the required R code and data files to produce all of the analyses and plots in:
-‘Human impacts indirectly drive mammal body size homogenization among communities’
+This repository contains the required R code and data files to produce all of the analyses and plots in:  
+‘Human impacts indirectly drive mammal body size homogenization among communities’  
 William Gearty, Lawrence H. Uricchio, and S. Kathleen Lyons
 
 ## Before running the code
