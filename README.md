@@ -7,23 +7,23 @@ Before running these R scripts, we suggest that you download this folder and set
 ## Required R packages
 Unless otherwise stated, the following packages can all be installed from CRAN:
 
-deeptime
-dggridR
-ggforce
-ggtern
-grid
-maptools (will be retired in 2023)
-moments
-MuMIn
-quantreg
-relaimpo
-rgbif
-sf
-spData
-stringr
-terra
-tidyverse
-viridis
+deeptime  
+dggridR  
+ggforce  
+ggtern  
+grid  
+maptools (will be retired in 2023)  
+moments  
+MuMIn  
+quantreg  
+relaimpo  
+rgbif  
+sf  
+spData  
+stringr  
+terra  
+tidyverse  
+viridis  
 
 The dggridR package is currently only available on GitHub and will need to be installed from there to reproduce
 these analyses and plots. This can be achieved by running the following commands in your R console (ignore the first line 
