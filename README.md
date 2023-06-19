@@ -1,5 +1,5 @@
 This repository contains the required R code and data files to produce all of the analyses and plots in:  
-‘Human impacts indirectly drive mammal body size homogenization among communities’  
+‘Human impacts are indirectly associated with mammal body size homogenization among communities’  
 William Gearty, Lawrence H. Uricchio, and S. Kathleen Lyons
 
 ## Before running the code
@@ -19,8 +19,10 @@ grid
 maptools (will be retired in 2023)  
 moments  
 MuMIn  
+patchwork  
 quantreg  
 relaimpo  
+reproj  
 rgbif  
 sf  
 spData  
@@ -38,8 +40,8 @@ devtools::install_github("r-barnes/dggridR")
 ```
 
   
-All other packages can be installed from CRAN. These scripts have been tested using R version 4.2.2 - 
-Copyright (C) 2022 The R Foundation for Statistical Computing.
+All other packages can be installed from CRAN. These scripts have been tested using R version 4.3.1 - 
+Copyright (C) 2023 The R Foundation for Statistical Computing.
 
 ## Data
 The IUCN range maps for terrestrial mammals are too large (~1GB total) to include in this repository. They should be downloaded from the IUCN here: https://www.iucnredlist.org/resources/spatial-data-download. Once downloaded, the files should be unzipped and placed into a into a folder named "MAMMALS_TERRESTRIAL_ONLY".

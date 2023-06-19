@@ -4,7 +4,9 @@ library(grid)
 library(rgbif)
 library(maptools)
 library(spData)
+library(reproj)
 library(deeptime)
+library(patchwork)
 library(viridis)
 library(ggtern)
 library(stringr)
@@ -37,8 +39,8 @@ print.ggplot <- function(x, newpage = is.null(vp), vp = NULL, ...){
   }
 }
 
-colsea = "#00509005"
-colland = "#66666660"
+colsea = "#ebf7ff"
+colland = "#ededed"
 
 #try different cut-offs of area of overlap of grid cells and ranges
 #try different grid cell sizes
@@ -246,6 +248,9 @@ grid_data <- mammal_grids %>% group_by(seqnum, continent) %>%
 grid_data <- grid_data %>%
   left_join(grid_coord, by = "seqnum")
 grid_data <- cbind(grid_data, st_coordinates(grid_data$geometry))
+# merge polygons
+grid_data <- grid_data %>%
+  left_join(grid_filt %>% rename(polygon = geometry), by = "seqnum")
 #merge footprint data
 grid_data <- grid_data %>%
   left_join(footprint.2009.means, by = "seqnum") %>%
@@ -269,42 +274,144 @@ grid_data[c("psmall","pmed","plarge")] <- grid_data[, c("n_small","n_med","n_lar
 # Filter out communities with fewer than 5 species
 grid_data_sub <- grid_data %>% filter(n >= 5)
 
+# convert geometry and coordinates to projected coordinates
+# Interrupted Goode homolosine
+xyz <- reproj(grid_data_sub[, c("X", "Y")], target = "+proj=igh", source = "+proj=longlat +datum=WGS84")
+grid_data_sub$X_igh <- xyz[, 1]
+grid_data_sub$Y_igh <- xyz[, 2]
+grid_data_sub$polygon_igh <- st_transform(grid_data_sub$polygon, crs = "+proj=igh")
+# Robinson
+xyz <- reproj(grid_data_sub[, c("X", "Y")], target = "+proj=robin", source = "+proj=longlat +datum=WGS84")
+grid_data_sub$X_robin <- xyz[, 1]
+grid_data_sub$Y_robin <- xyz[, 2]
+grid_data_sub$polygon_robin <- st_transform(grid_data_sub$polygon, crs = "+proj=robin")
+
+# Setup for projected plots ####
+## Goode homolosine ####
+# projection outline in long-lat coordinates
+crs_goode <- "+proj=igh"
+lats <- c(
+  90:-90, # right side down
+  -90:0, 0:-90, # third cut bottom
+  -90:0, 0:-90, # second cut bottom
+  -90:0, 0:-90, # first cut bottom
+  -90:90, # left side up
+  90:0, 0:90, # cut top
+  90 # close
+)
+longs <- c(
+  rep(180, 181), # right side down
+  rep(c(80.01, 79.99), each = 91), # third cut bottom
+  rep(c(-19.99, -20.01), each = 91), # second cut bottom
+  rep(c(-99.99, -100.01), each = 91), # first cut bottom
+  rep(-180, 181), # left side up
+  rep(c(-40.01, -39.99), each = 91), # cut top
+  180 # close
+)
+
+goode_outline <-
+  list(cbind(longs, lats)) %>%
+  st_polygon() %>%
+  st_sfc(
+    crs = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+  )
+# now we need to work in transformed coordinates, not in long-lat coordinates
+goode_outline <- st_transform(goode_outline, crs = crs_goode)
+
+# get the bounding box in transformed coordinates and expand by 10%
+xlim <- st_bbox(goode_outline)[c("xmin", "xmax")] * 1.05
+ylim <- st_bbox(goode_outline)[c("ymin", "ymax")] * 1.05
+
+# turn into enclosing rectangle
+goode_encl_rect <-
+  list(
+    cbind(
+      c(xlim[1], xlim[2], xlim[2], xlim[1], xlim[1]),
+      c(ylim[1], ylim[1], ylim[2], ylim[2], ylim[1])
+    )
+  ) %>%
+  st_polygon() %>%
+  st_sfc(crs = crs_goode)
+
+# calculate the area outside the earth outline as the difference
+# between the enclosing rectangle and the earth outline
+goode_without <- st_difference(goode_encl_rect, goode_outline)
+
+## Robinson ####
+lats <- c(
+  90:-90, # right side down
+  -90:90, # left side up
+  90 # close
+)
+longs <- c(
+  rep(180, 181), # right side down
+  rep(-180, 181), # left side up
+  180 # close
+)
+robin_outline <-
+  list(cbind(longs, lats)) %>%
+  st_polygon() %>%
+  st_sfc(
+    crs = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+  )
+# now we need to work in transformed coordinates, not in long-lat coordinates
+robin_outline <- st_transform(robin_outline, crs = "+proj=robin")
+
+# get the bounding box in transformed coordinates and expand by 10%
+xlim <- st_bbox(robin_outline)[c("xmin", "xmax")] * 1.05
+ylim <- st_bbox(robin_outline)[c("ymin", "ymax")] * 1.05
+
+# turn into enclosing rectangle
+robin_encl_rect <-
+  list(
+    cbind(
+      c(xlim[1], xlim[2], xlim[2], xlim[1], xlim[1]),
+      c(ylim[1], ylim[1], ylim[2], ylim[2], ylim[1])
+    )
+  ) %>%
+  st_polygon() %>%
+  st_sfc(crs = "+proj=robin")
+
+# calculate the area outside the earth outline as the difference
+# between the enclosing rectangle and the earth outline
+robin_without <- st_difference(robin_encl_rect, robin_outline)
+
 #Figure 2####
 lmsumm1 <- summary(lm(mass_disp~n, data = grid_data_sub))
 lmsumm2 <- summary(lm(kurt_mass~n, data = grid_data_sub))
 lmsumm3 <- summary(lm(skew_mass~n, data = grid_data_sub))
 
-g1 <- ggplot(grid_data_sub, aes(x = n, y = mass_disp)) +
-  geom_point(shape = 21, fill = "grey80") +
-  geom_smooth(method = lm, se = FALSE, color = "black", linetype = "dashed") +
+g2_a <- ggplot(grid_data_sub, aes(x = n, y = mass_disp)) +
+  geom_point(shape = 21, fill = "grey90", color = "grey30") +
+  geom_smooth(method = lm, se = FALSE, color = "red", linetype = "dashed", linewidth = 1.25) +
   scale_x_continuous(name = NULL) +
-  scale_y_continuous(name = "Mass Dispersion (log g)") +
+  scale_y_continuous(name = expression("Mass Dispersion (log"[10]*"g)")) +
   theme_classic(base_size = 24) +
-  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
-        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA)) +
-  annotate(geom = "text", x = 320, y = 2, hjust = 1, size = 10,
-           label = deparse(bquote(p == .(round(lmsumm1$coefficients[2,4], 3))*","~ R^2 == .(round(lmsumm1$r.squared, 3)))), parse = T)
-g2 <- ggplot(grid_data_sub, aes(x = n, y = kurt_mass)) +
-  geom_point(shape = 21, fill = "grey80") +
-  geom_smooth(method = lm, se = FALSE, color = "black", linetype = "dashed") +
+  theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines")) +
+  annotate(geom = "text", x = 320, y = 2.1, hjust = 1, size = 10,
+           label = deparse(bquote("p:"~.(format.pval(lmsumm1$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm1$r.squared, 3)))), parse = T)
+g2_b <- ggplot(grid_data_sub, aes(x = n, y = kurt_mass)) +
+  geom_point(shape = 21, fill = "grey90", color = "grey30") +
+  geom_smooth(method = lm, se = FALSE, color = "red", linetype = "dashed", linewidth = 1.25) +
   scale_x_continuous(name = NULL) +
   scale_y_continuous(name = "Mass Kurtosis") +
   theme_classic(base_size = 24) +
-  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
-        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA)) +
-  annotate(geom = "text", x = 320, y = 5.7, hjust = 1, size = 10,
-           label = deparse(bquote(p == .(round(lmsumm2$coefficients[2,4], 3))*","~ R^2 == .(round(lmsumm2$r.squared, 3)))), parse = T)
-g3 <- ggplot(grid_data_sub, aes(x = n, y = skew_mass)) +
-  geom_point(shape = 21, fill = "grey80") +
-  geom_smooth(method = lm, se = FALSE, color = "black", linetype = "dashed") +
+  theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines")) +
+  annotate(geom = "text", x = 320, y = 5.8, hjust = 1, size = 10,
+           label = deparse(bquote("p:"~.(format.pval(lmsumm2$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm2$r.squared, 3)))), parse = T)
+g2_c <- ggplot(grid_data_sub, aes(x = n, y = skew_mass)) +
+  geom_point(shape = 21, fill = "grey90", color = "grey30") +
+  geom_smooth(method = lm, se = FALSE, color = "red", linetype = "dashed", linewidth = 1.25) +
   scale_x_continuous(name = "Community Species Richness") +
   scale_y_continuous(name = "Mass Skewness") +
   theme_classic(base_size = 24) +
-  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
-        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA)) +
-  annotate(geom = "text", x = 320, y = 1.8, hjust = 1, size = 10,
-           label = deparse(bquote(p == .(round(lmsumm3$coefficients[2,4], 3))*","~ R^2 == .(round(lmsumm3$r.squared, 3)))), parse = T)
-gg <- ggarrange2(g1, g2, g3, ncol = 1, labels = c("(a)", "(b)", "(c)"),
+  theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines")) +
+  annotate(geom = "text", x = 320, y = 1.9, hjust = 1, size = 10,
+           label = deparse(bquote("p:"~.(format.pval(lmsumm3$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm3$r.squared, 3)))), parse = T)
+gg <- ggarrange2(g2_a, g2_b, g2_c, ncol = 1, labels = c("(a)", "(b)", "(c)"),
                  label.args = list(gp = grid::gpar(font = 2, cex = 2)),  draw = FALSE)
 ggsave("Mammal Ranges Stats by N.pdf", gg, width = 10, height = 15)
 
@@ -312,80 +419,115 @@ ggsave("Mammal Ranges Stats by N.pdf", gg, width = 10, height = 15)
 #mass moments and species richness
 g1 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub, aes(geometry = geometry, color = mass_disp)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = grid_data_sub, aes(geometry = polygon_robin, fill = mass_disp), color = NA) +
+  geom_sf(data = robin_without, fill = "white", color = "NA") +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Mass Dispersion") +
-  theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  labs(x = NULL, y = NULL, title = bquote(bold("(b)")~" Mass Dispersion")) +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(),
+        plot.margin = unit(c(.5,.5,0,.5), "cm"), panel.border = element_blank(),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        plot.title = element_text(hjust = -.05)) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g1_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(mass_disp), fill = viridis(30, option = "plasma")) +
   labs(x = expression("Mass Dispersion (log"[10]*"g)"), y = "# of Communities") +
   coord_cartesian(expand = FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
-        plot.margin = unit(c(.5,.5,.5,.5), "cm"))
+        plot.margin = unit(c(.5,.5,0,.5), "cm"))
 g2 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub, aes(geometry = geometry, color = kurt_mass)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = grid_data_sub, aes(geometry = polygon_robin, fill = kurt_mass), color = NA) +
+  geom_sf(data = robin_without, fill = "white", color = "NA") +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Mass Kurtosis") +
-  theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  labs(x = NULL, y = NULL, title = bquote(bold("(c)")~" Mass Kurtosis")) +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), panel.border = element_blank(),
+        plot.margin = unit(c(.5,.5,0,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        plot.title = element_text(hjust = -.025)) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g2_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(kurt_mass), fill = viridis(30, option = "plasma")) +
   labs(x = "Mass Kurtosis", y = "# of Communities") +
   coord_cartesian(expand = FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
-        plot.margin = unit(c(.5,.5,.5,.5), "cm"))
+        plot.margin = unit(c(.5,.5,0,.5), "cm"))
 g3 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub, aes(geometry = geometry, color = skew_mass)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = grid_data_sub, aes(geometry = polygon_robin, fill = skew_mass), color = NA) +
+  geom_sf(data = robin_without, fill = "white", color = "NA") +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Mass Skewness") +
-  theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  labs(x = NULL, y = NULL, title = bquote(bold("(d)")~" Mass Skewness")) +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), panel.border = element_blank(),
+        plot.margin = unit(c(.5,.5,0,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        plot.title = element_text(hjust = -.05)) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g3_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(skew_mass), fill = viridis(30, option = "plasma")) +
   labs(x = "Mass Skewness", y = "# of Communities") +
   coord_cartesian(expand = FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
-        plot.margin = unit(c(.5,.5,.5,.5), "cm"))
+        plot.margin = unit(c(.5,.5,0,.5), "cm"))
 g4 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub, aes(geometry = geometry, color = n)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = grid_data_sub, aes(geometry = polygon_robin, fill = n), color = NA) +
+  geom_sf(data = robin_without, fill = "white", color = "NA") +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Species Richness") +
-  theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  labs(x = NULL, y = NULL, title = bquote(bold("(a)")~" Species Richness")) +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(),
+        plot.margin = unit(c(.5,.5,0,.5), "cm"), panel.border = element_blank(),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        plot.title = element_text(hjust = -.05)) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g4_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(n), fill = viridis(30, option = "plasma")) +
   labs(x = "Species Richness", y = "# of Communities") +
   coord_cartesian(expand = FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
-        plot.margin = unit(c(.5,.5,.5,.5), "cm"))
-gg <- ggarrange2(g4,g4_hist,g1,g1_hist,g2,g2_hist,g3,g3_hist, ncol = 2, widths = c(2,1),
-                 labels = c("(a)", "", "(b)", "", "(c)", "", "(d)", ""),
-                 label.args = list(gp = grid::gpar(font = 2, cex = 2.5)),  draw = FALSE)
-ggsave("Mammal Ranges Mass Moments Maps.pdf", gg, width = 17.5, height = 25)
+        plot.margin = unit(c(.5,.5,0,.5), "cm"))
+gg <- ggarrange2(g4,g4_hist,g1,g1_hist,g2,g2_hist,g3,g3_hist, ncol = 2, widths = c(2,1),  draw = FALSE)
+ggsave("Mammal Ranges Mass Moments Maps.pdf", gg, width = 16, height = 25)
+
+#Figure 1/2 combined####
+gg <- ggarrange2(g1 + ggtitle(bquote(bold("(a)")~" Mass Dispersion")),
+                 g1_hist,
+                 g2_a + scale_x_continuous("Community Species Richness"),
+                 g2 + ggtitle(bquote(bold("(b)")~" Mass Kurtosis")),
+                 g2_hist,
+                 g2_b + scale_x_continuous("Community Species Richness"),
+                 g3 + ggtitle(bquote(bold("(c)")~" Mass Skewness")),
+                 g3_hist,
+                 g2_c,
+                 ncol = 3, widths = c(2, 1, 1.5), draw = FALSE)
+ggsave("Mammal Ranges Mass Moments Maps and Regressions.pdf", gg, width = 23, height = 18.75)
+# then plot species richness separately
+gg <- ggarrange2(g4 + ggtitle("Species Richness") + theme(plot.title = element_text(hjust = 0)),
+                 g4_hist, ncol = 2, widths = c(2,1),  draw = FALSE)
+ggsave("Mammal Ranges Species Richness Map.pdf", gg, width = 15.5, height = 6.25)
 
 #diet and range
 g1 <- ggplot() +
@@ -398,7 +540,7 @@ g1 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Mean of Plant Percentage of Diet") +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g1_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(mean_plant), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -416,7 +558,7 @@ g2 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Dispersion of Plant Percentage of Diet") +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g2_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(plant_disp), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -434,7 +576,7 @@ g3 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Mean Range Size (log"[10]*"m"^2*")")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g3_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(mean_range), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -452,7 +594,7 @@ g4 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Range Size Dispersion (log"[10]*"m"^2*")")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g4_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(range_disp), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -474,7 +616,7 @@ g1 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Mean Annual Temperature ("*degree*"C)")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g1_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio1_mean), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -492,7 +634,7 @@ g2 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Mean Temperature Seasonality ("*degree*"C * 100)")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g2_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio4_mean), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -510,7 +652,7 @@ g3 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Mean Annual Precipitation (mm)") +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g3_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio12_mean), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -528,7 +670,7 @@ g4 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Mean Precipitation Seasonality (%)") +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g4_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio15_mean), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -550,7 +692,7 @@ g1 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Mean Elevation (m)") +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g1_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(elev_mean), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -568,7 +710,7 @@ g2 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Elevation Variance (m"^2*")")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g2_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(elev_var), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -586,7 +728,7 @@ g3 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Mean Annual Temperature Variance ("*degree*"C"^2*")")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g3_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio1_var), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -604,7 +746,7 @@ g4 <- ggplot() +
   labs(x = NULL, y = NULL, title = expression("Annual Precipitation Variance (mm"^2*")")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  scale_color_viridis(option = "plasma", guide = "none")
 g4_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(bio12_var), fill = viridis(30, option = "plasma")) +
   labs(x = NULL, y = NULL) +
@@ -629,7 +771,7 @@ g1 <- ggplot() +
   labs(x = NULL, y = NULL, title = "Dietary Composition of Communities") +
   theme(axis.text = element_text(colour = "black")) +
   theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_fill_viridis(name = "Diet", discrete = TRUE, guide = FALSE)
+  scale_fill_viridis(name = "Diet", discrete = TRUE, guide = "none")
 pdiet_gather <- gather(grid_data_sub, "type", "value", c("pcarn","pomni","pherb"))
 pdiet_gather$type <- factor(pdiet_gather$type, levels = c("pherb","pomni","pcarn"))
 g1_hist <- ggplot(pdiet_gather) +
@@ -647,25 +789,30 @@ gg <- ggarrange2(g1, g1_hist, nrow = 1, widths = c(7,1), draw = FALSE)
 ggsave("Mammal Ranges Diet Pie Chart Map.pdf", gg, width = 30, height = 13.5)
 
 #Figure 3####
+pie_colors <- c("#21908CFF", "#ED7953FF", "#F0F921FF")
 size_gather <- gather(grid_data_sub, "type", "value", c("n_small","n_med","n_large"))
 size_gather$type <- factor(size_gather$type, levels = c("n_small","n_med","n_large"))
 g2 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_arc_bar(data = size_gather, aes(x0 = X, y0 = Y, r0 = 0, r = 1.1, amount = value,
-                                       group = seqnum, fill = type), stat='pie') +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=igh", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = goode_without, fill = "white", color = "NA") +
+  geom_sf(data = goode_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = crs_goode, expand = FALSE) +
+  geom_arc_bar(data = size_gather, aes(x0 = X_igh, y0 = Y_igh, r0 = 0, r = 110000, amount = value,
+                                       group = seqnum, fill = type), stat='pie', linewidth = .125) +
   theme_bw(base_size = 25) +
   labs(x = NULL, y = NULL, title = "Size Composition of Communities") +
-  theme(axis.text = element_text(colour = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_fill_viridis(name = "Diet", discrete = TRUE, guide = FALSE, option = "plasma")
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(),
+        plot.margin = unit(c(.5,.5,.5,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  scale_fill_manual(name = "Diet", values = pie_colors, guide = "none")
 psize_gather <- gather(grid_data_sub, "type", "value", c("psmall","pmed","plarge"))
 psize_gather$type <- factor(psize_gather$type, levels = c("psmall","pmed","plarge"))
 g2_hist <- ggplot(psize_gather) +
   geom_histogram(aes(value * 100, fill = type), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
-  scale_fill_viridis(discrete = TRUE, option = "plasma") +
+  scale_fill_manual(values = pie_colors) +
   scale_x_continuous(name = NULL, limits = c(0, 100)) +
   scale_y_continuous(name = "# of Communities") +
   coord_cartesian(expand = FALSE) +
@@ -674,8 +821,111 @@ g2_hist <- ggplot(psize_gather) +
         plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
   facet_wrap(~type, ncol = 1, strip.position = "right", scales = "free_x",
              labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+g2_hist_horiz <- ggplot(psize_gather) +
+  geom_histogram(aes(value * 100, fill = type), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
+  scale_fill_manual(values = pie_colors) +
+  scale_x_continuous(name = NULL, limits = c(0, 100)) +
+  scale_y_continuous(name = "# of Communities") +
+  coord_cartesian(expand = FALSE) +
+  theme_classic(base_size = 25) +
+  theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
+        plot.margin = unit(c(.5,.5,.5,.5), "cm"), panel.spacing.x = unit(.05, "npc")) +
+  facet_wrap(~type, nrow = 1, strip.position = "top", scales = "free_x",
+             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
 gg <- ggarrange2(g2, g2_hist, nrow = 1, widths = c(7,1), draw = FALSE)
-ggsave("Mammal Ranges Size Pie Chart Map.pdf", gg, width = 30, height = 13.5)
+ggsave("Mammal Ranges Size Pie Chart Map_Goode.pdf", gg, width = 30, height = 12)
+gg <- g2 / g2_hist_horiz + plot_layout(heights = c(3, 1))
+ggsave("Mammal Ranges Size Pie Chart Map_Goode2.pdf", gg, width = 30, height = 21)
+
+# Faceted map
+g2_facet <- ggplot() +
+  geom_sf(data = land, fill = colland) +
+  geom_sf(data = st_graticule(crs = "+proj=igh", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)) %>% select(-type), color = "gray70") +
+  geom_sf(data = psize_gather, aes(geometry = polygon_igh, fill = value * 100), linewidth = .125) +
+  geom_sf(data = goode_without, fill = "white", color = "NA") +
+  geom_sf(data = goode_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = crs_goode, expand = FALSE) +
+  theme_bw(base_size = 25) +
+  labs(x = NULL, y = NULL, title = "Size Composition of Communities") +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(),
+        plot.margin = unit(c(.5,0,.5,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        strip.background = element_rect(fill = "white", colour = "black", linewidth = rel(2)),
+        panel.spacing.y = unit(0.04, "npc")) +
+  scale_fill_viridis(name = "% of community", guide = "none", option = "plasma") +
+  facet_wrap(~type, ncol = 1, strip.position = "left",
+             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+g2_hist_facet <- ggplot(psize_gather) +
+  geom_histogram(aes(value * 100, fill = after_stat(x)), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
+  scale_fill_viridis(option = "plasma") +
+  scale_x_continuous(name = "% of Community", limits = c(0, 100)) +
+  scale_y_continuous(name = "# of Communities") +
+  coord_cartesian(expand = FALSE) +
+  theme_classic(base_size = 25) +
+  theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
+        plot.margin = unit(c(.5,.5,.5,0), "cm")) +
+  facet_wrap(~type, ncol = 1, scales = "free_x", strip.position = "right",
+             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+gg <- g2_facet + g2_hist_facet + plot_layout(widths = c(2.5,1))
+ggsave("Mammal Ranges Size Pie Chart Map_Goode_Faceted.pdf", gg, width = 18, height = 16)
+
+# With Robinson projection
+g2 <- ggplot() +
+  geom_sf(data = land, fill = colland) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = robin_without, fill = "white", color = NA) +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
+  geom_arc_bar(data = size_gather, aes(x0 = X_robin, y0 = Y_robin, r0 = 0, r = 110000, amount = value,
+                                       group = seqnum, fill = type), stat='pie', linewidth = .125) +
+  theme_bw(base_size = 25) +
+  labs(x = NULL, y = NULL, title = "Size Composition of Communities") +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(),
+        plot.margin = unit(c(.5,.5,.5,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank()) +
+  scale_fill_manual(name = "Diet", values = pie_colors, guide = "none")
+gg <- ggarrange2(g2, g2_hist, nrow = 1, widths = c(7,1), draw = FALSE)
+ggsave("Mammal Ranges Size Pie Chart Map_Robin.pdf", gg, width = 30, height = 13.5)
+gg <- g2 / g2_hist_horiz + plot_layout(heights = c(3, 1))
+ggsave("Mammal Ranges Size Pie Chart Map_Robin2.pdf", gg, width = 30, height = 21)
+
+# Faceted plot
+g2_facet <- ggplot() +
+  geom_sf(data = land, fill = colland) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)) %>% select(-type), color = "gray70") +
+  geom_sf(data = psize_gather, aes(geometry = polygon_robin, fill = value * 100), color = NA) +
+  geom_sf(data = robin_without, fill = "white", color = "NA") +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
+  theme_bw(base_size = 25) +
+  labs(x = NULL, y = NULL, title = "Size Composition of Communities") +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), panel.border = element_blank(),
+        plot.margin = unit(c(.5,0,.5,.5), "cm"),
+        axis.ticks = element_blank(), axis.text = element_blank(),
+        strip.background = element_rect(fill = "white", colour = "black", linewidth = rel(2)),
+        panel.spacing.y = unit(0.04, "npc")) +
+  scale_fill_viridis(name = "% of community", guide = "none", option = "plasma") +
+  facet_wrap(~factor(type, levels = c("plarge", "pmed", "psmall")), ncol = 1, strip.position = "left",
+             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+g2_hist_facet <- ggplot(psize_gather) +
+  geom_histogram(aes(value * 100, fill = after_stat(x)), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
+  scale_fill_viridis(option = "plasma") +
+  scale_x_continuous(name = "% of Community", limits = c(0, 100)) +
+  scale_y_continuous(name = "# of Communities") +
+  coord_cartesian(expand = FALSE) +
+  theme_classic(base_size = 25) +
+  theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
+        plot.margin = unit(c(.5,.5,.5,0), "cm")) +
+  facet_wrap(~factor(type, levels = c("plarge", "pmed", "psmall")), ncol = 1, scales = "free_x", strip.position = "right",
+             labeller = as_labeller(c("psmall" = "% <100g", "pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+gg <- g2_facet + g2_hist_facet + plot_layout(widths = c(2.5,1))
+ggsave("Mammal Ranges Size Pie Chart Map_Robin_Faceted.pdf", gg, width = 15.5, height = 16)
 
 #Null model setup####
 mammals_in_grids <- merge(unique(mammal_grids["binomial"]) %>% rename(IUCN_species = binomial), mammal_traits_IUCN, all.x = TRUE)
@@ -719,14 +969,14 @@ g1 <- ggplot(grid_data_sub_cont) +
   geom_point(aes(x = n, y = mean_sim_disp), shape = 21, fill = "grey100", show.legend = TRUE) +
   geom_point(aes(x = n, y = mass_disp, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
   coord_cartesian(ylim = c(.5, 2.25), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
-  scale_x_continuous(name = "Community Species Richness", expand = c(0.001, 0.001)) +
-  scale_y_continuous(name = "Mass Dispersion (log g)") +
+  scale_x_continuous(name = "Species Richness", expand = c(0.001, 0.001)) +
+  scale_y_continuous(name = expression("Mass Dispersion (log"[10]*"g)")) +
   scale_fill_manual(name = NULL, labels = c("< 17.5% Large Species", "> 17.5% Large Species", "Null Model"),
                     values = viridis_pal()(5)[c(2,4)]) +
-  theme_classic(base_size = 24) +
+  theme_classic(base_size = 30) +
   theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
-        legend.position = c(.775, .95), legend.box.margin = margin(0,0,0,0),
+        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
         legend.margin = margin(0,0,0,0), strip.background = element_blank(),
         legend.background = element_rect(fill = NA)) +
   guides(fill = guide_legend(override.aes = list("size" = 3)))
@@ -735,15 +985,15 @@ g2 <- ggplot(grid_data_sub_cont) +
   geom_point(aes(x = plarge, y = mean_diff, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
   geom_smooth(aes(x = plarge, y = mean_diff), method = lm, se = FALSE, color = "black", linetype = "dashed") +
   annotate(geom = "text", x = .7, y = -.4, hjust = 1, size = 10,
-           label = deparse(bquote(p == .(round(lmsumm$coefficients[2,4], 3))*","~ R^2 == .(round(lmsumm$r.squared, 3)))), parse = T) +
-  scale_x_continuous(name = "Community Proportion of Large Species (>10kg)") +
-  scale_y_continuous(name = "Mass Dispersion Deviation (log g)") +
+           label = deparse(bquote("p:"~.(format.pval(lmsumm$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm$r.squared, 3)))), parse = T) +
+  scale_x_continuous(name = "Proportion of Large Species (>10kg)") +
+  scale_y_continuous(name = expression("Mass Dispersion Deviation (log"[10]*"g)")) +
   scale_fill_manual(name = NULL, labels = c("< 17.5% Large Species", "> 17.5% Large Species"),
                     values = viridis_pal()(5)[c(2,4)]) +
-  theme_classic(base_size = 24) +
+  theme_classic(base_size = 30) +
   theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
-        legend.position = c(.225, .95), legend.box.margin = margin(0,0,0,0),
+        legend.position = c(.27, .95), legend.box.margin = margin(0,0,0,0),
         legend.margin = margin(0,0,0,0), strip.background = element_blank(),
         legend.background = element_rect(fill = NA)) +
   guides(fill = guide_legend(override.aes = list("size" = 3)))
@@ -755,18 +1005,22 @@ ggsave("Mammal Ranges Simulation Variance - Ranges and Diet Maintained with plar
 #plot simulation value and simulation difference on map
 g1 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub_cont, aes(geometry = geometry, color = mean_sim_disp)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = robin_without, fill = "white", color = NA) +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  geom_sf(data = grid_data_sub_cont, aes(geometry = polygon_robin, fill = mean_sim_disp), color = NA) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Null Model Mean Mass Dispersion") +
+  labs(x = NULL, y = NULL, title = bquote(bold("(a)")~" Null Model Mean Mass Dispersion")) +
   theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), plot.margin = unit(c(.5,.5,.5,.5), "cm"),
+        panel.border = element_blank(), ) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g1_hist <- ggplot(data = grid_data_sub_cont) +
   geom_histogram(aes(mean_sim_disp), fill = viridis(30, option = "plasma")) +
-  labs(x = "Null Mass Dispersion (log g)", y = "# of Communities") +
+  labs(x = expression("Null Mass Dispersion (log"[10]*"g)"), y = "# of Communities") +
   coord_cartesian(expand =FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
@@ -774,25 +1028,28 @@ g1_hist <- ggplot(data = grid_data_sub_cont) +
 
 g2 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_sf(data = grid_data_sub_cont, aes(geometry = geometry, color = mean_diff)) +
-  coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
-  scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
-  scale_y_continuous(expand = c(0,0), breaks = c(seq(-90,90,30)), minor_breaks = NULL) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = robin_without, fill = "white", color = NA) +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  geom_sf(data = grid_data_sub_cont, aes(geometry = polygon_robin, fill = mean_diff), color = NA) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
-  labs(x = NULL, y = NULL, title = "Observed Mass Dispersion - Null Model Mean Mass Dispersion") +
+  labs(x = NULL, y = NULL, title = bquote(bold("(b)")~" Observed Mass Dispersion - Null Model Mean Mass Dispersion")) +
   theme(axis.text = element_text(color = "black")) +
-  theme(panel.background = element_rect(fill = colsea), plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
-  scale_color_viridis(option = "plasma", guide = FALSE)
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), plot.margin = unit(c(.5,.5,.5,.5), "cm"),
+        panel.border = element_blank(), ) +
+  scale_fill_viridis(option = "plasma", guide = "none")
 g2_hist <- ggplot(data = grid_data_sub_cont) +
   geom_histogram(aes(mean_diff), fill = viridis(30, option = "plasma")) +
-  labs(x = "Deviation from the Null (log g)", y = "# of Communities") +
+  labs(x = expression("Deviation from the Null (log"[10]*"g)"), y = "# of Communities") +
   coord_cartesian(expand =FALSE) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,.5,.5), "cm"))
-gg <- ggarrange2(g1, g1_hist, g2, g2_hist, ncol = 2, widths = c(2,1), labels = c("(a)", "", "(b)", ""),
-                 label.args = list(gp = grid::gpar(font = 2, cex = 2.5)),  draw = FALSE)
-ggsave("Mammal Ranges Simulation Values and Deviations - Ranges and Diet Maintained.pdf", gg, width = 20, height = 15)
+gg <- ggarrange2(g1, g1_hist, g2, g2_hist, ncol = 2, widths = c(2,1),  draw = FALSE)
+ggsave("Mammal Ranges Simulation Values and Deviations - Ranges and Diet Maintained.pdf", gg, width = 19, height = 15)
 
 # Relative Importance ####
 # What are the best predictors of variance in general?
