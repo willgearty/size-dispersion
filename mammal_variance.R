@@ -4,19 +4,20 @@ library(grid)
 library(rgbif)
 library(maptools)
 library(spData)
-library(reproj)
 library(deeptime)
 library(patchwork)
 library(viridis)
-library(ggtern)
+#library(ggtern)
 library(stringr)
 #devtools::install_github("r-barnes/dggridR", vignette=TRUE)
 library(dggridR)
+library(spdep)
 library(moments)
 library(quantreg)
 library(ggforce)
 library(relaimpo)
 library(MuMIn)
+library(parallel)
 library(tidyverse)
 
 #from https://github.com/skgallagher/EpiCompare/blob/master/R/aaa.R#L61
@@ -50,14 +51,15 @@ colland = "#ededed"
 #terrestrial mammals using IUCN ranges
 #download from here: https://www.iucnredlist.org/resources/spatial-data-download
 #then unzip all of the files into a folder named "MAMMALS_TERRESTRIAL_ONLY"
-mammal_IUCN <- st_read(dsn = "MAMMALS_TERRESTRIAL_ONLY", seqnum = "MAMMALS_TERRESTRIAL_ONLY")
+mammal_IUCN <- st_read(dsn = "MAMMALS_TERRESTRIAL_ONLY/MAMMALS_TERRESTRIAL_ONLY.shp")
 
 #a map of the world
 data(wrld_simpl)
 wrld_sf <- st_as_sf(wrld_simpl)
 
 #get IUCN species, including synonyms
-#both are downloaded from the IUCN website
+# "search summary" data retrieved from:
+# https://www.iucnredlist.org/search?dl=true&permalink=6da36cdc-5f19-46e7-b980-aeb06b2b6208
 mammal_IUCN_synonyms <- subset(read.csv("synonyms.csv", stringsAsFactors = FALSE), infraType != "subspecies") %>%
   unite(species, genusName, speciesName, sep = " ") %>% dplyr::select(IUCN_species = scientificName, species, speciesAuthor)
 mammal_IUCN_synonyms$species <- trimws(gsub("<i>|</i>", "", mammal_IUCN_synonyms$species))
@@ -76,7 +78,15 @@ mammal_traits <- read.table("EltonTraits.txt", sep = "\t", header = T, stringsAs
 mammal_traits$Plant.Per <- rowSums(mammal_traits[c("Diet.Fruit", "Diet.Nect", "Diet.Seed", "Diet.PlantO")])
 mammal_traits$Trophic.Level <- cut(mammal_traits$Plant.Per, c(-1,5,95,101), c("Carnivore", "Omnivore", "Herbivore"))
 mammal_traits$BodyMass.log10 <- log10(mammal_traits$BodyMass.Value)
-mammal_traits$size_cat <- cut(mammal_traits$BodyMass.log10, c(0,2,4,10), labels = c("small", "medium", "large"), ordered_result = TRUE)
+# small: 1g - 1000g (1kg)
+# medium: 1kg - 10kg
+# large: 10kg+
+mammal_traits$size_cat <- cut(mammal_traits$BodyMass.log10, c(0,3,4,10), labels = c("small", "medium", "large"), ordered_result = TRUE)
+# large: 10kg - 100kg
+# xlarge: 100kg - 1000kg (bovids, big deer, big cats, bears, big boars, giraffes, camels, gorillas)
+# xxlarge: 1000kg+ (elephants and rhinos)
+mammal_traits$size_cat2 <- cut(mammal_traits$BodyMass.log10, c(0,3,4,5,6,10),
+                               labels = c("small", "medium", "large", "xlarge", "xxlarge"), ordered_result = TRUE)
 
 #merge in trait data
 mammal_traits_IUCN <- merge(mammal_IUCN_synonyms, mammal_traits, by.x = "IUCN_species", by.y = "Scientific", all.x = TRUE)
@@ -90,7 +100,9 @@ mammal_traits_IUCN <- mammal_traits_IUCN[!is.na(mammal_traits_IUCN$Trophic.Level
 mammal_traits_IUCN <- mammal_traits_IUCN[order(mammal_traits_IUCN$IUCN_species, mammal_traits_IUCN$Diet.Certainty, -(mammal_traits_IUCN$BodyMass.SpecLevel == 1)),]
 mammal_traits_IUCN <- mammal_traits_IUCN[!duplicated(mammal_traits_IUCN$IUCN_species),]
 
-mammal_IUCN_filt <- merge(mammal_IUCN, mammal_traits_IUCN, by.x = "binomial", by.y = "IUCN_species", all.x = TRUE)
+# remove bats
+mammal_IUCN_filt <- mammal_IUCN %>%
+  filter(order_ != "CHIROPTERA")
 
 #Setup Spatial Cells####
 #setup equal area grid cells
@@ -109,6 +121,7 @@ sf_use_s2(FALSE) #st_make_valid doesn't work well with s2 right now
 grid_overlap <- cbind(grid_coord, over_land = sapply(st_within(grid_coord, st_make_valid(wrld_sf)), function(x) length(x) > 0))
 sf_use_s2(TRUE)
 grid_filt <- grid[grid_overlap$over_land,]
+grid_filt_vect <- vect(grid_filt)
 
 #Get geographic data####
 #human footprint index
@@ -119,7 +132,6 @@ grid_filt <- grid[grid_overlap$over_land,]
 footprint.2009 <- app(rast("wildareas-v3-2009-human-footprint.tif"), fun=function(x) { x[x>50 | x<0] <- NA; return(x) })
 footprint.1993 <- app(rast("wildareas-v3-1993-human-footprint.tif"), fun=function(x) { x[x>50 | x<0] <- NA; return(x) })
 
-grid_filt_vect <- vect(grid_filt)
 footprint.2009.means <- terra::extract(footprint.2009, project(grid_filt_vect, crs(footprint.2009)), fun = mean, na.rm = T)
 colnames(footprint.2009.means) <- c("seqnum", "footprint.2009")
 footprint.1993.means <- terra::extract(footprint.1993, project(grid_filt_vect, crs(footprint.2009)), fun = mean, na.rm = TRUE)
@@ -132,7 +144,7 @@ footprint.2009.means$seqnum <- footprint.1993.means$seqnum <- grid_filt$seqnum
 #.1 degree = ~10km resolution
 deforestation <- rast("def_hot_for/w001001.adf")
 #make other land pixels 0
-wrld_rast <- rasterize(wrld_sf, deforestation, fun=function(x, ...){0})
+wrld_rast <- subst(rasterize(wrld_sf, deforestation, fun=min), from = 1, to = 0)
 deforestation <- merge(deforestation, wrld_rast)
 deforestation.means <- terra::extract(deforestation, project(grid_filt_vect, crs(deforestation)), fun=mean, na.rm = TRUE)
 colnames(deforestation.means) <- c("seqnum", "deforestation")
@@ -176,31 +188,41 @@ elev_means$seqnum <- elev_vars$seqnum <- grid_filt$seqnum
 # get range size for each species
 # area in square meters
 sf_use_s2(FALSE)
-mammal_IUCN_clean <- st_make_valid(mammal_IUCN_filt)
-mammal_IUCN_clean$SHAPE_Area <- st_area(mammal_IUCN_clean)
+mammal_IUCN_clean <- st_make_valid(mammal_IUCN_filt) %>%
+  filter(grepl("Extant", legend, fixed = TRUE) & category != "EX") %>%
+  rename(binomial = "sci_name")
 mammal_ranges <- mammal_IUCN_clean %>%
-  st_drop_geometry() %>%
   group_by(binomial) %>%
-  summarize(range_size = sum(SHAPE_Area), n_shapes = length(SHAPE_Area))
+  summarize(n_shapes = n(), geometry = st_union(geometry)) %>%
+  mutate(range_size = st_area(geometry))
 sf_use_s2(TRUE)
-mammal_IUCN_clean <- left_join(mammal_IUCN_clean, mammal_ranges, by = "binomial")
+mammal_ranges <- left_join(mammal_ranges, mammal_traits_IUCN, by = c("binomial" = "IUCN_species"))
+
+# get IUCN red list category
+mammal_IUCN_cat <- mammal_IUCN_clean %>%
+  st_drop_geometry() %>%
+  dplyr::select(binomial, category) %>%
+  unique() %>%
+  mutate(category = factor(category, ordered = TRUE,
+                           levels = c("DD","LC","NT","VU","EN","CR","EW","EX")))
+mammal_ranges <- left_join(mammal_ranges, mammal_IUCN_cat, by = "binomial")
 
 # find which species intersect with which grid cells
 # this can require a bit of time and RAM
-intrsct <- terra::intersect(grid_filt_vect, vect(mammal_IUCN_clean))
+intrsct <- terra::intersect(grid_filt_vect, vect(mammal_ranges))
 
 # Extract areas from polygon objects then attach as attribute
 # area in square meters
 mammal_grids <- as.data.frame(intrsct)
 mammal_grids$area <- expanse(intrsct)
-mammal_grids$BodyMass.log10 <- log10(mammal_grids$BodyMass.Value)
 mammal_grids$range_size.log10 <- log10(as.numeric(mammal_grids$range_size))
 
 #determine continent of each seqnum
+# world comes from spData
 conts <- world %>%
   st_wrap_dateline() %>%
   st_make_valid() %>%
-  select(continent) %>%
+  dplyr::select(continent) %>%
   drop_na() %>%
   group_by(continent) %>%
   summarize(geometry = st_union(geom)) %>%
@@ -212,12 +234,9 @@ mammal_grids <- merge(mammal_grids,
                       conts %>%
                         st_drop_geometry() %>%
                         group_by(seqnum) %>%
-                        summarize(continent = continent[which.max(area)]),
+                        summarize(continent = continent[which.max(area)]) %>%
+                        mutate(continent = factor(continent)),
                       by = "seqnum", all.x = TRUE)
-
-#Order IUCN categories
-mammal_grids$category <- factor(mammal_grids$category, ordered = TRUE,
-                                levels = c("DD","LC","NT","VU","EN","CR","EW","EX"))
 
 #Grid cell data####
 #calculate number of species overlapping with grid cell, size stats, diet stats, range stats
@@ -227,9 +246,16 @@ grid_data <- mammal_grids %>% group_by(seqnum, continent) %>%
             min_mass = min(BodyMass.log10, na.rm = TRUE), max_mass = max(BodyMass.log10, na.rm = TRUE),
             n_mass = sum(!is.na(BodyMass.Value)), var_mass = var(BodyMass.log10, na.rm = TRUE),
             mass_disp = mean(dist(BodyMass.log10, method = "manhattan"), na.rm = TRUE), #body mass dispersion https://onlinelibrary.wiley.com/doi/full/10.1111/geb.12667
+            mass_disp_s = mean(dist(BodyMass.log10[size_cat == "small"], method = "manhattan"), na.rm = TRUE),
+            mass_disp_m = mean(dist(BodyMass.log10[size_cat == "medium"], method = "manhattan"), na.rm = TRUE),
+            mass_disp_l = mean(dist(BodyMass.log10[size_cat == "large"], method = "manhattan"), na.rm = TRUE),
+            mass_disp_sm = mean(dist(BodyMass.log10[size_cat != "large"], method = "manhattan"), na.rm = TRUE),
+            mass_disp_no_xl = mean(dist(BodyMass.log10[BodyMass.log10 < 5], method = "manhattan"), na.rm = TRUE),
             skew_mass = skewness(BodyMass.log10, na.rm = TRUE), kurt_mass = kurtosis(BodyMass.log10, na.rm = TRUE),
-            n_small = sum(BodyMass.log10 < 2, na.rm = TRUE), n_large = sum(BodyMass.log10 >= 4, na.rm = TRUE),
-            n_med = sum(BodyMass.log10 >= 2 & BodyMass.log10 < 4, na.rm = TRUE),
+            n_small = sum(size_cat == "small", na.rm = TRUE), n_med = sum(size_cat == "medium", na.rm = TRUE),
+            n_large = sum(size_cat == "large", na.rm = TRUE, na.rm = TRUE),
+            n_xl = sum(size_cat2 == "xlarge", na.rm = TRUE), n_xxl = sum(size_cat2 == "xxlarge", na.rm = TRUE),
+            n_xl_xxl = sum(BodyMass.log10 > 5, na.rm = TRUE),
             carn = sum(Trophic.Level == "Carnivore", na.rm = TRUE), omni = sum(Trophic.Level == "Omnivore", na.rm = TRUE),
             herb = sum(Trophic.Level == "Herbivore", na.rm = TRUE), n_diet = sum(!is.na(Plant.Per)),
             mean_plant = mean(Plant.Per, na.rm = TRUE), var_plant = var(Plant.Per, na.rm = TRUE),
@@ -276,12 +302,12 @@ grid_data_sub <- grid_data %>% filter(n >= 5)
 
 # convert geometry and coordinates to projected coordinates
 # Interrupted Goode homolosine
-xyz <- reproj(grid_data_sub[, c("X", "Y")], target = "+proj=igh", source = "+proj=longlat +datum=WGS84")
+xyz <- sf_project(grid_data_sub[, c("X", "Y")], to = "+proj=igh", from = "+proj=longlat +datum=WGS84")
 grid_data_sub$X_igh <- xyz[, 1]
 grid_data_sub$Y_igh <- xyz[, 2]
 grid_data_sub$polygon_igh <- st_transform(grid_data_sub$polygon, crs = "+proj=igh")
 # Robinson
-xyz <- reproj(grid_data_sub[, c("X", "Y")], target = "+proj=robin", source = "+proj=longlat +datum=WGS84")
+xyz <- sf_project(grid_data_sub[, c("X", "Y")], to = "+proj=robin", from = "+proj=longlat +datum=WGS84")
 grid_data_sub$X_robin <- xyz[, 1]
 grid_data_sub$Y_robin <- xyz[, 2]
 grid_data_sub$polygon_robin <- st_transform(grid_data_sub$polygon, crs = "+proj=robin")
@@ -389,7 +415,7 @@ g2_a <- ggplot(grid_data_sub, aes(x = n, y = mass_disp)) +
   theme_classic(base_size = 24) +
   theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines")) +
-  annotate(geom = "text", x = 320, y = 2.1, hjust = 1, size = 10,
+  annotate(geom = "text", x = 200, y = 1.95, hjust = 1, size = 10,
            label = deparse(bquote("p:"~.(format.pval(lmsumm1$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm1$r.squared, 3)))), parse = T)
 g2_b <- ggplot(grid_data_sub, aes(x = n, y = kurt_mass)) +
   geom_point(shape = 21, fill = "grey90", color = "grey30") +
@@ -399,7 +425,7 @@ g2_b <- ggplot(grid_data_sub, aes(x = n, y = kurt_mass)) +
   theme_classic(base_size = 24) +
   theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines")) +
-  annotate(geom = "text", x = 320, y = 5.8, hjust = 1, size = 10,
+  annotate(geom = "text", x = 200, y = 4.8, hjust = 1, size = 10,
            label = deparse(bquote("p:"~.(format.pval(lmsumm2$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm2$r.squared, 3)))), parse = T)
 g2_c <- ggplot(grid_data_sub, aes(x = n, y = skew_mass)) +
   geom_point(shape = 21, fill = "grey90", color = "grey30") +
@@ -409,7 +435,7 @@ g2_c <- ggplot(grid_data_sub, aes(x = n, y = skew_mass)) +
   theme_classic(base_size = 24) +
   theme(axis.ticks = element_line(color = "black"), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines")) +
-  annotate(geom = "text", x = 320, y = 1.9, hjust = 1, size = 10,
+  annotate(geom = "text", x = 200, y = 1.4, hjust = 1, size = 10,
            label = deparse(bquote("p:"~.(format.pval(lmsumm3$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm3$r.squared, 3)))), parse = T)
 gg <- ggarrange2(g2_a, g2_b, g2_c, ncol = 1, labels = c("(a)", "(b)", "(c)"),
                  label.args = list(gp = grid::gpar(font = 2, cex = 2)),  draw = FALSE)
@@ -505,7 +531,7 @@ g4 <- ggplot() +
 g4_hist <- ggplot(data = grid_data_sub) +
   geom_histogram(aes(n), fill = viridis(30, option = "plasma")) +
   labs(x = "Species Richness", y = "# of Communities") +
-  coord_cartesian(expand = FALSE) +
+  coord_cartesian(expand = FALSE, xlim = c(0, NA)) +
   theme_classic(base_size = 25) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,0,.5), "cm"))
@@ -762,7 +788,7 @@ diet_gather <- gather(grid_data_sub, "type", "value", c("carn","omni","herb"))
 diet_gather$type <- factor(diet_gather$type, levels = c("herb","omni","carn"))
 g1 <- ggplot() +
   geom_sf(data = land, fill = colland) +
-  geom_arc_bar(data = diet_gather, aes(x0 = x, y0 = y, r0 = 0, r = 1.1, amount = value,
+  geom_arc_bar(data = diet_gather, aes(x0 = X, y0 = Y, r0 = 0, r = 1.1, amount = value,
                                        group = seqnum, fill = type), stat='pie') +
   coord_sf(xlim = c(-180, 180), ylim = c(-90, 90)) +
   scale_x_continuous(expand = c(0,0), breaks = c(seq(-180,180,30)), minor_breaks = NULL) +
@@ -820,7 +846,7 @@ g2_hist <- ggplot(psize_gather) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,.5,.5), "cm")) +
   facet_wrap(~type, ncol = 1, strip.position = "right", scales = "free_x",
-             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 g2_hist_horiz <- ggplot(psize_gather) +
   geom_histogram(aes(value * 100, fill = type), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
   scale_fill_manual(values = pie_colors) +
@@ -831,7 +857,7 @@ g2_hist_horiz <- ggplot(psize_gather) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,.5,.5), "cm"), panel.spacing.x = unit(.05, "npc")) +
   facet_wrap(~type, nrow = 1, strip.position = "top", scales = "free_x",
-             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 gg <- ggarrange2(g2, g2_hist, nrow = 1, widths = c(7,1), draw = FALSE)
 ggsave("Mammal Ranges Size Pie Chart Map_Goode.pdf", gg, width = 30, height = 12)
 gg <- g2 / g2_hist_horiz + plot_layout(heights = c(3, 1))
@@ -841,7 +867,7 @@ ggsave("Mammal Ranges Size Pie Chart Map_Goode2.pdf", gg, width = 30, height = 2
 g2_facet <- ggplot() +
   geom_sf(data = land, fill = colland) +
   geom_sf(data = st_graticule(crs = "+proj=igh", lon = seq(-180, 180, 30),
-                              lat = seq(-90, 90, 30)) %>% select(-type), color = "gray70") +
+                              lat = seq(-90, 90, 30)) %>% dplyr::select(-type), color = "gray70") +
   geom_sf(data = psize_gather, aes(geometry = polygon_igh, fill = value * 100), linewidth = .125) +
   geom_sf(data = goode_without, fill = "white", color = "NA") +
   geom_sf(data = goode_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
@@ -856,7 +882,7 @@ g2_facet <- ggplot() +
         panel.spacing.y = unit(0.04, "npc")) +
   scale_fill_viridis(name = "% of community", guide = "none", option = "plasma") +
   facet_wrap(~type, ncol = 1, strip.position = "left",
-             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 g2_hist_facet <- ggplot(psize_gather) +
   geom_histogram(aes(value * 100, fill = after_stat(x)), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
   scale_fill_viridis(option = "plasma") +
@@ -867,7 +893,7 @@ g2_hist_facet <- ggplot(psize_gather) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,.5,0), "cm")) +
   facet_wrap(~type, ncol = 1, scales = "free_x", strip.position = "right",
-             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 gg <- g2_facet + g2_hist_facet + plot_layout(widths = c(2.5,1))
 ggsave("Mammal Ranges Size Pie Chart Map_Goode_Faceted.pdf", gg, width = 18, height = 16)
 
@@ -897,7 +923,7 @@ ggsave("Mammal Ranges Size Pie Chart Map_Robin2.pdf", gg, width = 30, height = 2
 g2_facet <- ggplot() +
   geom_sf(data = land, fill = colland) +
   geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
-                              lat = seq(-90, 90, 30)) %>% select(-type), color = "gray70") +
+                              lat = seq(-90, 90, 30)) %>% dplyr::select(-type), color = "gray70") +
   geom_sf(data = psize_gather, aes(geometry = polygon_robin, fill = value * 100), color = NA) +
   geom_sf(data = robin_without, fill = "white", color = "NA") +
   geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
@@ -912,7 +938,7 @@ g2_facet <- ggplot() +
         panel.spacing.y = unit(0.04, "npc")) +
   scale_fill_viridis(name = "% of community", guide = "none", option = "plasma") +
   facet_wrap(~factor(type, levels = c("plarge", "pmed", "psmall")), ncol = 1, strip.position = "left",
-             labeller = as_labeller(c("psmall" = "% <100g","pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 g2_hist_facet <- ggplot(psize_gather) +
   geom_histogram(aes(value * 100, fill = after_stat(x)), binwidth = 2.5, boundary = 25, show.legend = FALSE) +
   scale_fill_viridis(option = "plasma") +
@@ -923,7 +949,7 @@ g2_hist_facet <- ggplot(psize_gather) +
   theme(axis.text = element_text(color = "black"), axis.ticks = element_line(color = "black"),
         plot.margin = unit(c(.5,.5,.5,0), "cm")) +
   facet_wrap(~factor(type, levels = c("plarge", "pmed", "psmall")), ncol = 1, scales = "free_x", strip.position = "right",
-             labeller = as_labeller(c("psmall" = "% <100g", "pmed" = "% 100g - 10kg", "plarge" = "% >10kg")))
+             labeller = as_labeller(c("psmall" = "% <1kg","pmed" = "% 1kg - 10kg", "plarge" = "% >10kg")))
 gg <- g2_facet + g2_hist_facet + plot_layout(widths = c(2.5,1))
 ggsave("Mammal Ranges Size Pie Chart Map_Robin_Faceted.pdf", gg, width = 15.5, height = 16)
 
@@ -946,6 +972,7 @@ for(i in 1:num_sim){
   grid_data_sim_sub <- grid_data_sim %>% filter(n >= 5)
   sim_data_cont[,i] <- grid_data_sim_sub$mass_disp
 }
+close(pb)
 
 sim_results_cont <- cbind(data.frame(sim = rep(seq(1:num_sim), each = nrow(grid_data_sub)), sim_disp = as.vector(sim_data_cont), diff = as.vector(grid_data_sub$mass_disp - sim_data_cont)),
                           grid_data_sub[rep(seq_len(nrow(grid_data_sub)), num_sim), ])
@@ -955,51 +982,86 @@ grid_data_sub_cont <- subset(sim_results_cont, !is.na(mass_disp)) %>%
   summarize(mean_sim_disp = mean(sim_disp, na.rm = TRUE), sd_sim_disp = sd(sim_disp, na.rm = TRUE),
             mean_diff = mean(diff, na.rm = TRUE),
             var_diff = var(diff, na.rm = TRUE),
+            p_two = wilcox.test(sim_disp, mu = unique(mass_disp))$p.value,
             p_less = wilcox.test(sim_disp, mu = unique(mass_disp), alternative = "less")$p.value,
-            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp), alternative = "greater")$p.value)
-grid_data_sub_cont$p_less_adjust <- p.adjust(grid_data_sub_cont$p_less, method = "fdr", n = nrow(grid_data_sub_cont) * 2)
-grid_data_sub_cont$p_greater_adjust <- p.adjust(grid_data_sub_cont$p_greater, method = "fdr", n = nrow(grid_data_sub_cont) * 2)
+            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp), alternative = "greater")$p.value,
+            .groups = "drop")
+grid_data_sub_cont$p_two_adjust <- p.adjust(grid_data_sub_cont$p_two, method = "fdr", n = nrow(grid_data_sub_cont))
+grid_data_sub_cont$p_less_adjust <- p.adjust(grid_data_sub_cont$p_less, method = "fdr", n = nrow(grid_data_sub_cont))
+grid_data_sub_cont$p_greater_adjust <- p.adjust(grid_data_sub_cont$p_greater, method = "fdr", n = nrow(grid_data_sub_cont))
 
 table(cut(grid_data_sub_cont$p_less_adjust, c(0,0.05,1)), exclude = NULL)/nrow(grid_data_sub_cont)
 
+#Null model 2 with Diet, Size Category, Ranges, and Continents Maintained####
+num_sim <- 100
+sim_data_cont2 <- matrix(NA, nrow = nrow(grid_data_sub), ncol = num_sim)
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  mammal_size_sim <- mammals_in_grids_cont %>% group_by(continent, size_cat, Trophic.Level) %>% mutate(mass = sample(BodyMass.log10)) %>% rename(binomial = IUCN_species)
+  mammal_grids_sim <- merge(mammal_grids %>% dplyr::select(-BodyMass.Value, -size_cat, -Trophic.Level), mammal_size_sim, by = c("binomial", "continent"))
+  grid_data_sim <- mammal_grids_sim %>% group_by(seqnum) %>% summarise(n = n(), n_mass = sum(!is.na(mass)), mean = mean(mass, na.rm = TRUE), var = var(mass, na.rm = TRUE), mass_disp = mean(dist(mass, method = "manhattan"), na.rm = TRUE))
+  grid_data_sim_sub <- grid_data_sim %>% filter(n >= 5)
+  sim_data_cont2[,i] <- grid_data_sim_sub$mass_disp
+}
+close(pb)
+
+sim_results_cont2 <- cbind(data.frame(sim = rep(seq(1:num_sim), each = nrow(grid_data_sub)), sim_disp = as.vector(sim_data_cont2), diff = as.vector(grid_data_sub$mass_disp - sim_data_cont2)),
+                           grid_data_sub[rep(seq_len(nrow(grid_data_sub)), num_sim), ])
+
+grid_data_sub_cont2 <- subset(sim_results_cont2, !is.na(mass_disp)) %>%
+  group_by(across(c(-sim, -sim_disp, -diff))) %>%
+  summarize(mean_sim_disp = mean(sim_disp, na.rm = TRUE), sd_sim_disp = sd(sim_disp, na.rm = TRUE),
+            mean_diff = mean(diff, na.rm = TRUE),
+            var_diff = var(diff, na.rm = TRUE),
+            p_two = wilcox.test(sim_disp, mu = unique(mass_disp))$p.value,
+            p_less = wilcox.test(sim_disp, mu = unique(mass_disp), alternative = "less")$p.value,
+            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp), alternative = "greater")$p.value,
+            .groups = "drop")
+grid_data_sub_cont2$p_two_adjust <- p.adjust(grid_data_sub_cont2$p_two, method = "fdr", n = nrow(grid_data_sub_cont2))
+grid_data_sub_cont2$p_less_adjust <- p.adjust(grid_data_sub_cont2$p_less, method = "fdr", n = nrow(grid_data_sub_cont2))
+grid_data_sub_cont2$p_greater_adjust <- p.adjust(grid_data_sub_cont2$p_greater, method = "fdr", n = nrow(grid_data_sub_cont2))
+
+table(cut(grid_data_sub_cont2$p_less_adjust, c(0,0.05,1)), exclude = NULL)/nrow(grid_data_sub_cont2)
+
 #Figure 5####
-g1 <- ggplot(grid_data_sub_cont) +
+g1 <- ggplot(grid_data_sub_cont2) +
   geom_errorbar(aes(x = n, ymin = mean_sim_disp - 2 * sd_sim_disp,
                     ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
   geom_point(aes(x = n, y = mean_sim_disp), shape = 21, fill = "grey100", show.legend = TRUE) +
   geom_point(aes(x = n, y = mass_disp, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
   coord_cartesian(ylim = c(.5, 2.25), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
-  scale_x_continuous(name = "Species Richness", expand = c(0.001, 0.001)) +
+  scale_x_continuous(name = "Community Species Richness", expand = c(0.001, 0.001)) +
   scale_y_continuous(name = expression("Mass Dispersion (log"[10]*"g)")) +
-  scale_fill_manual(name = NULL, labels = c("< 17.5% Large Species", "> 17.5% Large Species", "Null Model"),
+  scale_fill_manual(name = NULL, labels = c("< 18.5% Large Species", "> 18.5% Large Species", "Null Model"),
                     values = viridis_pal()(5)[c(2,4)]) +
   theme_classic(base_size = 30) +
   theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
-        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
+        legend.position = c(.73, .92), legend.box.margin = margin(0,0,0,0),
         legend.margin = margin(0,0,0,0), strip.background = element_blank(),
         legend.background = element_rect(fill = NA)) +
   guides(fill = guide_legend(override.aes = list("size" = 3)))
-lmsumm <- summary(lm(mean_diff~plarge, data = grid_data_sub_cont))
-g2 <- ggplot(grid_data_sub_cont) +
-  geom_point(aes(x = plarge, y = mean_diff, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
-  geom_smooth(aes(x = plarge, y = mean_diff), method = lm, se = FALSE, color = "black", linetype = "dashed") +
-  annotate(geom = "text", x = .7, y = -.4, hjust = 1, size = 10,
-           label = deparse(bquote("p:"~.(format.pval(lmsumm$coefficients[2,4], 1))*";"~R^2*":"~.(round(lmsumm$r.squared, 3)))), parse = T) +
-  scale_x_continuous(name = "Proportion of Large Species (>10kg)") +
-  scale_y_continuous(name = expression("Mass Dispersion Deviation (log"[10]*"g)")) +
-  scale_fill_manual(name = NULL, labels = c("< 17.5% Large Species", "> 17.5% Large Species"),
+g2 <- ggplot(grid_data_sub_cont2) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_errorbar(aes(x = mass_disp, ymin = mean_sim_disp - 2 * sd_sim_disp,
+                    ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
+  geom_point(aes(x = mass_disp, y = mean_sim_disp, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
+  scale_x_continuous(name = expression("Observed Mass Dispersion (log"[10]*"g)")) +
+  scale_y_continuous(name = expression("Null Mass Dispersion (log"[10]*"g)")) +
+  scale_fill_manual(name = NULL, labels = c("< 18.5% Large Species", "> 18.5% Large Species", "Null Model"),
                     values = viridis_pal()(5)[c(2,4)]) +
+  coord_cartesian(xlim = c(.5, 2.7), ylim = c(.5, 2.7)) +
   theme_classic(base_size = 30) +
   theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
         plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
-        legend.position = c(.27, .95), legend.box.margin = margin(0,0,0,0),
+        legend.position = c(.27, .92), legend.box.margin = margin(0,0,0,0),
         legend.margin = margin(0,0,0,0), strip.background = element_blank(),
         legend.background = element_rect(fill = NA)) +
   guides(fill = guide_legend(override.aes = list("size" = 3)))
 gg <- ggarrange2(g1, g2, ncol = 2, widths = c(1,1), labels = c("(a)", "(b)"),
                  label.args = list(gp = grid::gpar(font = 2, cex = 2.5)),  draw = FALSE)
-ggsave("Mammal Ranges Simulation Variance - Ranges and Diet Maintained with plarge.pdf", gg, width = 20, height = 10)
+ggsave("Mammal Ranges Simulation Variance - Ranges and Diet Maintained.pdf", gg, width = 20, height = 10)
 
 #Figure 4####
 #plot simulation value and simulation difference on map
@@ -1009,16 +1071,16 @@ g1 <- ggplot() +
                               lat = seq(-90, 90, 30)), color = "gray70") +
   geom_sf(data = robin_without, fill = "white", color = NA) +
   geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
-  geom_sf(data = grid_data_sub_cont, aes(geometry = polygon_robin, fill = mean_sim_disp), color = NA) +
+  geom_sf(data = grid_data_sub_cont2, aes(geometry = polygon_robin, fill = mean_sim_disp), color = NA) +
   coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
   labs(x = NULL, y = NULL, title = bquote(bold("(a)")~" Null Model Mean Mass Dispersion")) +
   theme(axis.text = element_text(color = "black")) +
   theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
         panel.grid.major = element_blank(), plot.margin = unit(c(.5,.5,.5,.5), "cm"),
-        panel.border = element_blank(), ) +
+        panel.border = element_blank()) +
   scale_fill_viridis(option = "plasma", guide = "none")
-g1_hist <- ggplot(data = grid_data_sub_cont) +
+g1_hist <- ggplot(data = grid_data_sub_cont2) +
   geom_histogram(aes(mean_sim_disp), fill = viridis(30, option = "plasma")) +
   labs(x = expression("Null Mass Dispersion (log"[10]*"g)"), y = "# of Communities") +
   coord_cartesian(expand =FALSE) +
@@ -1032,7 +1094,7 @@ g2 <- ggplot() +
                               lat = seq(-90, 90, 30)), color = "gray70") +
   geom_sf(data = robin_without, fill = "white", color = NA) +
   geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
-  geom_sf(data = grid_data_sub_cont, aes(geometry = polygon_robin, fill = mean_diff), color = NA) +
+  geom_sf(data = grid_data_sub_cont2, aes(geometry = polygon_robin, fill = mean_diff), color = NA) +
   coord_sf(crs = "+proj=robin", expand = FALSE) +
   theme_bw(base_size = 25) +
   labs(x = NULL, y = NULL, title = bquote(bold("(b)")~" Observed Mass Dispersion - Null Model Mean Mass Dispersion")) +
@@ -1041,7 +1103,7 @@ g2 <- ggplot() +
         panel.grid.major = element_blank(), plot.margin = unit(c(.5,.5,.5,.5), "cm"),
         panel.border = element_blank(), ) +
   scale_fill_viridis(option = "plasma", guide = "none")
-g2_hist <- ggplot(data = grid_data_sub_cont) +
+g2_hist <- ggplot(data = grid_data_sub_cont2) +
   geom_histogram(aes(mean_diff), fill = viridis(30, option = "plasma")) +
   labs(x = expression("Deviation from the Null (log"[10]*"g)"), y = "# of Communities") +
   coord_cartesian(expand =FALSE) +
@@ -1051,12 +1113,284 @@ g2_hist <- ggplot(data = grid_data_sub_cont) +
 gg <- ggarrange2(g1, g1_hist, g2, g2_hist, ncol = 2, widths = c(2,1),  draw = FALSE)
 ggsave("Mammal Ranges Simulation Values and Deviations - Ranges and Diet Maintained.pdf", gg, width = 19, height = 15)
 
+
+#Null model 3 without big things####
+num_sim <- 100
+grid_data_sub_sm <- grid_data_sub %>% filter((n - n_large) >= 5)
+sim_data_cont3 <- matrix(NA, nrow = nrow(grid_data_sub_sm), ncol = num_sim)
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  mammal_size_sim <- mammals_in_grids_cont %>% filter(size_cat != "large") %>% group_by(continent, size_cat, Trophic.Level) %>% mutate(mass = sample(BodyMass.log10)) %>% rename(binomial = IUCN_species)
+  mammal_grids_sim <- merge(mammal_grids %>% dplyr::select(-BodyMass.Value, -size_cat, -Trophic.Level), mammal_size_sim, by = c("binomial", "continent"))
+  grid_data_sim <- mammal_grids_sim %>% group_by(seqnum) %>% summarise(n = n(), n_mass = sum(!is.na(mass)), mean = mean(mass, na.rm = TRUE), var = var(mass, na.rm = TRUE), mass_disp = mean(dist(mass, method = "manhattan"), na.rm = TRUE))
+  grid_data_sim_sub <- grid_data_sim %>% filter(n >= 5)
+  sim_data_cont3[,i] <- grid_data_sim_sub$mass_disp
+}
+close(pb)
+
+sim_results_cont3 <- cbind(data.frame(sim = rep(seq(1:num_sim), each = nrow(grid_data_sub_sm)), sim_disp = as.vector(sim_data_cont3), diff = as.vector(grid_data_sub_sm$mass_disp_sm - sim_data_cont3)),
+                           grid_data_sub_sm[rep(seq_len(nrow(grid_data_sub_sm)), num_sim), ])
+
+grid_data_sub_cont3 <- subset(sim_results_cont3, !is.na(mass_disp_sm)) %>%
+  group_by(across(c(-sim, -sim_disp, -diff))) %>%
+  summarize(mean_sim_disp = mean(sim_disp, na.rm = TRUE), sd_sim_disp = sd(sim_disp, na.rm = TRUE),
+            mean_diff = mean(diff, na.rm = TRUE),
+            var_diff = var(diff, na.rm = TRUE),
+            p_two = wilcox.test(sim_disp, mu = unique(mass_disp_sm))$p.value,
+            p_less = wilcox.test(sim_disp, mu = unique(mass_disp_sm), alternative = "less")$p.value,
+            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp_sm), alternative = "greater")$p.value,
+            .groups = "drop")
+grid_data_sub_cont3$p_two_adjust <- p.adjust(grid_data_sub_cont3$p_two, method = "fdr", n = nrow(grid_data_sub_cont3))
+grid_data_sub_cont3$p_less_adjust <- p.adjust(grid_data_sub_cont3$p_less, method = "fdr", n = nrow(grid_data_sub_cont3))
+grid_data_sub_cont3$p_greater_adjust <- p.adjust(grid_data_sub_cont3$p_greater, method = "fdr", n = nrow(grid_data_sub_cont3))
+
+table(cut(grid_data_sub_cont3$p_less_adjust, c(0,0.05,1)), exclude = NULL)/nrow(grid_data_sub_cont3)
+
+sm_summ_xl_xxl <- grid_data_sub_cont3 %>%
+  group_by(n_xl_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+sm_summ_xxl <- grid_data_sub_cont3 %>%
+  group_by(n_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+ggplot(grid_data_sub_cont3) +
+  geom_violin(aes(x = as.factor(n_xl_xxl), y = mean_diff)) +
+  geom_text(data = sm_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = sm_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 100 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+ggplot(grid_data_sub_cont2) +
+  geom_violin(aes(x = as.factor(n_xxl), y = mean_diff)) +
+  geom_text(data = sm_summ_xxl, aes(x = as.factor(n_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = sm_summ_xxl, aes(x = as.factor(n_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 1000 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+# plots
+g1 <- ggplot(grid_data_sub_cont3) +
+  geom_errorbar(aes(x = n, ymin = mean_sim_disp - 2 * sd_sim_disp,
+                    ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
+  geom_point(aes(x = n, y = mean_sim_disp), shape = 21, fill = "grey100", show.legend = TRUE) +
+  geom_point(aes(x = n, y = mass_disp_sm, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
+  coord_cartesian(ylim = c(.4, 2), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
+  scale_x_continuous(name = "Species Richness", expand = c(0.001, 0.001)) +
+  scale_y_continuous(name = expression("Mass Dispersion (log"[10]*"g)")) +
+  scale_fill_manual(name = NULL, labels = c("< 18.5% Large Species", "> 18.5% Large Species", "Null Model"),
+                    values = viridis_pal()(5)[c(2,4)]) +
+  theme_classic(base_size = 30) +
+  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
+        legend.margin = margin(0,0,0,0), strip.background = element_blank(),
+        legend.background = element_rect(fill = NA)) +
+  guides(fill = guide_legend(override.aes = list("size" = 3)))
+
+g2 <- ggplot(grid_data_sub_cont3) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_errorbar(aes(x = mass_disp_sm, ymin = mean_sim_disp - 2 * sd_sim_disp,
+                    ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
+  geom_point(aes(x = mass_disp_sm, y = mean_sim_disp, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21, show.legend = TRUE) +
+  #coord_cartesian(ylim = c(.5, 2.25), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
+  scale_x_continuous(name = expression("Observed Mass Dispersion (log"[10]*"g)")) +
+  scale_y_continuous(name = expression("Null Mass Dispersion (log"[10]*"g)")) +
+  scale_fill_manual(name = NULL, labels = c("< 17.5% Large Species", "> 17.5% Large Species", "Null Model"),
+                    values = viridis_pal()(5)[c(2,4)]) +
+  theme_classic(base_size = 30) +
+  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
+        legend.margin = margin(0,0,0,0), strip.background = element_blank(),
+        legend.background = element_rect(fill = NA)) +
+  guides(fill = guide_legend(override.aes = list("size" = 3)))
+gg <- ggarrange2(g1, g2, ncol = 2, widths = c(1,1),  draw = FALSE)
+ggsave("Mammal Ranges Null 2 no large.pdf", gg, width = 20, height = 10)
+
+#Null model 4 only small things####
+num_sim <- 100
+grid_data_sub_s <- grid_data_sub %>% filter(n_small >= 5)
+sim_data_cont4 <- matrix(NA, nrow = nrow(grid_data_sub_s), ncol = num_sim)
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  mammal_size_sim <- mammals_in_grids_cont %>% filter(size_cat == "small") %>% group_by(continent, size_cat, Trophic.Level) %>% mutate(mass = sample(BodyMass.log10)) %>% rename(binomial = IUCN_species)
+  mammal_grids_sim <- merge(mammal_grids %>% dplyr::select(-BodyMass.Value, -size_cat, -Trophic.Level), mammal_size_sim, by = c("binomial", "continent"))
+  grid_data_sim <- mammal_grids_sim %>% group_by(seqnum) %>% summarise(n = n(), n_mass = sum(!is.na(mass)), mean = mean(mass, na.rm = TRUE), var = var(mass, na.rm = TRUE), mass_disp = mean(dist(mass, method = "manhattan"), na.rm = TRUE))
+  grid_data_sim_sub <- grid_data_sim %>% filter(n >= 5)
+  sim_data_cont4[,i] <- grid_data_sim_sub$mass_disp
+}
+close(pb)
+
+sim_results_cont4 <- cbind(data.frame(sim = rep(seq(1:num_sim), each = nrow(grid_data_sub_s)), sim_disp = as.vector(sim_data_cont4), diff = as.vector(grid_data_sub_s$mass_disp_s - sim_data_cont4)),
+                           grid_data_sub_s[rep(seq_len(nrow(grid_data_sub_s)), num_sim), ])
+
+grid_data_sub_cont4 <- subset(sim_results_cont4, !is.na(mass_disp_s)) %>%
+  group_by(across(c(-sim, -sim_disp, -diff))) %>%
+  summarize(mean_sim_disp = mean(sim_disp, na.rm = TRUE), sd_sim_disp = sd(sim_disp, na.rm = TRUE),
+            mean_diff = mean(diff, na.rm = TRUE),
+            var_diff = var(diff, na.rm = TRUE),
+            p_two = wilcox.test(sim_disp, mu = unique(mass_disp_s))$p.value,
+            p_less = wilcox.test(sim_disp, mu = unique(mass_disp_s), alternative = "less")$p.value,
+            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp_s), alternative = "greater")$p.value,
+            .groups = "drop")
+grid_data_sub_cont4$p_two_adjust <- p.adjust(grid_data_sub_cont4$p_two, method = "fdr", n = nrow(grid_data_sub_cont4))
+grid_data_sub_cont4$p_less_adjust <- p.adjust(grid_data_sub_cont4$p_less, method = "fdr", n = nrow(grid_data_sub_cont4))
+grid_data_sub_cont4$p_greater_adjust <- p.adjust(grid_data_sub_cont4$p_greater, method = "fdr", n = nrow(grid_data_sub_cont4))
+
+table(cut(grid_data_sub_cont4$p_less_adjust, c(0,0.05,1)), exclude = NULL)/nrow(grid_data_sub_cont3)
+
+small_summ_xl_xxl <- grid_data_sub_cont4 %>%
+  group_by(n_xl_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+small_summ_xxl <- grid_data_sub_cont4 %>%
+  group_by(n_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+ggplot(grid_data_sub_cont4) +
+  geom_violin(aes(x = as.factor(n_xl_xxl), y = mean_diff)) +
+  geom_text(data = small_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = small_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 100 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+ggplot(grid_data_sub_cont4) +
+  geom_violin(aes(x = as.factor(n_xxl), y = mean_diff)) +
+  geom_text(data = small_summ_xxl, aes(x = as.factor(n_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = small_summ_xxl, aes(x = as.factor(n_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 1000 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+# plots
+g1 <- ggplot(grid_data_sub_cont4) +
+  geom_errorbar(aes(x = n, ymin = mean_sim_disp - 2 * sd_sim_disp,
+                    ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
+  geom_point(aes(x = n, y = mean_sim_disp), shape = 21, fill = "grey100", show.legend = TRUE) +
+  geom_point(aes(x = n, y = mass_disp_s, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21) +
+  coord_cartesian(ylim = c(0, 1.3), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
+  scale_x_continuous(name = "Species Richness", expand = c(0.001, 0.001)) +
+  scale_y_continuous(name = expression("Mass Dispersion (log"[10]*"g)")) +
+  scale_fill_manual(name = NULL, labels = c("< 18.5% Large Species", "> 18.5% Large Species", "Null Model"),
+                    values = viridis_pal()(5)[c(2,4)]) +
+  theme_classic(base_size = 30) +
+  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
+        legend.margin = margin(0,0,0,0), strip.background = element_blank(),
+        legend.background = element_rect(fill = NA)) +
+  guides(fill = guide_legend(override.aes = list("size" = 3)))
+
+g2 <- ggplot(grid_data_sub_cont4) +
+  geom_abline(slope = 1, intercept = 0) +
+  geom_errorbar(aes(x = mass_disp_s, ymin = mean_sim_disp - 2 * sd_sim_disp,
+                    ymax = mean_sim_disp + 2 * sd_sim_disp), width = 0, color = "grey70") +
+  geom_point(aes(x = mass_disp_s, y = mean_sim_disp, fill = cut(plarge, quantile(plarge, c(0, .5, 1)), include.lowest = TRUE)), shape = 21, show.legend = TRUE) +
+  #coord_cartesian(ylim = c(.5, 2.25), xlim = c(0, max(grid_data_sub_cont$n) + 2)) +
+  scale_x_continuous(name = expression("Observed Mass Dispersion (log"[10]*"g)")) +
+  scale_y_continuous(name = expression("Null Mass Dispersion (log"[10]*"g)")) +
+  scale_fill_manual(name = NULL, labels = c("< 18.5% Large Species", "> 18.5% Large Species", "Null Model"),
+                    values = viridis_pal()(5)[c(2,4)]) +
+  theme_classic(base_size = 30) +
+  theme(axis.ticks = element_line(color = "black"), axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position = c(.73, .95), legend.box.margin = margin(0,0,0,0),
+        legend.margin = margin(0,0,0,0), strip.background = element_blank(),
+        legend.background = element_rect(fill = NA)) +
+  guides(fill = guide_legend(override.aes = list("size" = 3)))
+gg <- ggarrange2(g1, g2, ncol = 2, widths = c(1,1),  draw = FALSE)
+ggsave("Mammal Ranges Null 2 small only.pdf", gg, width = 20, height = 10)
+
+#Null model 5 only medium things####
+num_sim <- 100
+grid_data_sub_m <- grid_data_sub %>% filter(n_med >= 5)
+sim_data_cont5 <- matrix(NA, nrow = nrow(grid_data_sub_m), ncol = num_sim)
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  mammal_size_sim <- mammals_in_grids_cont %>% filter(size_cat == "medium") %>% group_by(continent, size_cat, Trophic.Level) %>% mutate(mass = sample(BodyMass.log10)) %>% rename(binomial = IUCN_species)
+  mammal_grids_sim <- merge(mammal_grids %>% dplyr::select(-BodyMass.Value, -size_cat, -Trophic.Level), mammal_size_sim, by = c("binomial", "continent"))
+  grid_data_sim <- mammal_grids_sim %>% group_by(seqnum) %>% summarise(n = n(), n_mass = sum(!is.na(mass)), mean = mean(mass, na.rm = TRUE), var = var(mass, na.rm = TRUE), mass_disp = mean(dist(mass, method = "manhattan"), na.rm = TRUE))
+  grid_data_sim_sub <- grid_data_sim %>% filter(n >= 5)
+  sim_data_cont5[,i] <- grid_data_sim_sub$mass_disp
+}
+close(pb)
+
+sim_results_cont5 <- cbind(data.frame(sim = rep(seq(1:num_sim), each = nrow(grid_data_sub_m)), sim_disp = as.vector(sim_data_cont5), diff = as.vector(grid_data_sub_m$mass_disp_m - sim_data_cont5)),
+                           grid_data_sub_m[rep(seq_len(nrow(grid_data_sub_m)), num_sim), ])
+
+grid_data_sub_cont5 <- subset(sim_results_cont5, !is.na(mass_disp_m)) %>%
+  group_by(across(c(-sim, -sim_disp, -diff))) %>%
+  summarize(mean_sim_disp = mean(sim_disp, na.rm = TRUE), sd_sim_disp = sd(sim_disp, na.rm = TRUE),
+            mean_diff = mean(diff, na.rm = TRUE),
+            var_diff = var(diff, na.rm = TRUE),
+            p_two = wilcox.test(sim_disp, mu = unique(mass_disp_m))$p.value,
+            p_less = wilcox.test(sim_disp, mu = unique(mass_disp_m), alternative = "less")$p.value,
+            p_greater = wilcox.test(sim_disp, mu = unique(mass_disp_m), alternative = "greater")$p.value,
+            .groups = "drop")
+grid_data_sub_cont5$p_two_adjust <- p.adjust(grid_data_sub_cont5$p_two, method = "fdr", n = nrow(grid_data_sub_cont5))
+grid_data_sub_cont5$p_less_adjust <- p.adjust(grid_data_sub_cont5$p_less, method = "fdr", n = nrow(grid_data_sub_cont5))
+grid_data_sub_cont5$p_greater_adjust <- p.adjust(grid_data_sub_cont5$p_greater, method = "fdr", n = nrow(grid_data_sub_cont5))
+
+table(cut(grid_data_sub_cont5$p_less_adjust, c(0,0.05,1)), exclude = NULL)/nrow(grid_data_sub_cont3)
+
+med_summ_xl_xxl <- grid_data_sub_cont5 %>%
+  group_by(n_xl_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+med_summ_xxl <- grid_data_sub_cont5 %>%
+  group_by(n_xxl) %>%
+  summarize(higher = sum(mean_diff > 0 & p_less_adjust < 0.05)/n(),
+            lower = sum(mean_diff < 0 & p_greater_adjust < 0.05)/n(), n = n())
+
+ggplot(grid_data_sub_cont5) +
+  geom_violin(aes(x = as.factor(n_xl_xxl), y = mean_diff)) +
+  geom_text(data = med_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = med_summ_xl_xxl, aes(x = as.factor(n_xl_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 100 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+ggplot(grid_data_sub_cont5) +
+  geom_violin(aes(x = as.factor(n_xxl), y = mean_diff)) +
+  geom_text(data = med_summ_xxl, aes(x = as.factor(n_xxl), label = round(higher, 2)), y = 0.3) +
+  geom_text(data = med_summ_xxl, aes(x = as.factor(n_xxl), label = round(lower, 2)), y = -0.3) +
+  scale_y_continuous("Mean Mass Dispersion Difference (Observed - Null)") +
+  scale_x_discrete("# of Mammal Species > 1000 kg") +
+  coord_cartesian(ylim = c(-.3, .3))
+
+# Correlations####
+# check correlations between variables
+var_cors <- cor(grid_data_sub_clean[, c("n", "n_xl_xxl", "psmall", "plarge", "pcarn", "pherb",
+                                        "plant_disp", "mean_plant", "mean_range", "range_disp",
+                                        "footprint.2009", "deforestation",
+                                        "bio1_mean", "bio4_mean", "bio5_mean", "bio6_mean",
+                                        "bio12_mean", "bio15_mean", "elev_mean")])
+colnames(var_cors) <- gsub("\n", " ", labels[colnames(var_cors)])
+rownames(var_cors) <- gsub("\n", " ", labels[rownames(var_cors)])
+var_cors_filt <- var_cors[upper.tri(var_cors)]
+table(var_cors_filt > 0)
+summary(var_cors_filt[var_cors_filt > 0])
+summary(var_cors_filt[var_cors_filt < 0])
+table(abs(var_cors_filt) > 0.5)
+write.csv(var_cors, "correlations.csv")
+
 # Relative Importance ####
 # What are the best predictors of variance in general?
 labels <- c("continent" = "Continent",
             "continentAsia" = "Asia", "continentOceania" = "Oceania", "continentEurope" = "Europe",
             "continentNorth America" = "North America", "continentSouth America" = "South America",
-            "n" = "Species Richness",
+            "n" = "Species Richness", "n_xl_xxl" = "# Species > 100kg",
             "max_mass" = "Maximum Mass*", "min_mass" = "Minimum Mass*",
             "psmall" = "% Small-Sized*", "pmed" = "% Medium-Sized*",
             "plarge" = "% Large-Sized*", "mean_plant" = "Mean % Plant\nin Diet",
@@ -1074,25 +1408,25 @@ labels <- c("continent" = "Continent",
 
 ## Observed dispersion ####
 #(should avoid things that are relevant to calculating variance)
-grid_data_sub_clean <- subset(grid_data_sub, !is.na(mass_disp) & !is.na(elev_mean))
-grid_data_sub_clean$continent <- factor(grid_data_sub_clean$continent)
-reg1 <- lm(mass_disp ~ n + pcarn + pherb + plant_disp + mean_plant + mean_range + range_disp +
-             continent + footprint.2009 + deforestation + bio1_mean + bio4_mean + bio5_mean +
-             bio6_mean + bio12_mean + bio15_mean + bio1_var + bio4_var + bio5_var + bio6_var +
-             bio12_var + bio15_var + elev_mean + elev_var,
-           data = grid_data_sub_clean, na.action = "na.fail")
+grid_data_sub_clean <- subset(grid_data_sub)
+reg1 <- lm(mass_disp ~ n + n_xl_xxl + pcarn + pherb + plant_disp + mean_plant + mean_range + range_disp +
+             continent + footprint.2009 + deforestation +
+             bio1_mean + bio4_mean + bio5_mean + bio6_mean + bio12_mean + bio15_mean + elev_mean,
+          #    s(Y, X, bs="sos", k=60),
+           #   bio1_var + bio4_var + bio5_var + bio6_var +
+           #   bio12_var + bio15_var + elev_var,
+           data = grid_data_sub_clean, na.action = "na.omit")
 relimp1 <- calc.relimp(reg1, type = "lmg")
 sort(relimp1@lmg, decreasing = TRUE)
 
 ## Deviation from null ####
 # remove pmed and pomni to prevent singularity issues
-grid_data_sub_cont_clean <- subset(grid_data_sub_cont, !is.na(mean_diff) & !is.na(elev_mean))
-grid_data_sub_cont_clean$continent <- factor(grid_data_sub_cont_clean$continent)
-reg2 <- lm(mean_diff ~ n + max_mass + min_mass + psmall + plarge + pcarn + pherb +
+grid_data_sub_cont2_clean <- subset(grid_data_sub_cont2)
+reg2 <- lm(mean_diff ~ n + n_xl_xxl + psmall + plarge + pcarn + pherb +
              plant_disp + mean_plant + mean_range + range_disp + continent + footprint.2009 + deforestation +
-             bio1_mean + bio4_mean + bio5_mean + bio6_mean + bio12_mean + bio15_mean +
-             bio1_var + bio4_var + bio5_var + bio6_var + bio12_var + bio15_var + elev_mean + elev_var,
-           data = grid_data_sub_cont_clean, weights = 1/var_diff, na.action = "na.fail")
+             bio1_mean + bio4_mean + bio5_mean + bio6_mean + bio12_mean + bio15_mean + elev_mean,
+             #bio1_var + bio4_var + bio5_var + bio6_var + bio12_var + bio15_var + elev_var,
+           data = grid_data_sub_cont2_clean, weights = 1/var_diff, na.action = "na.omit")
 relimp2 <- calc.relimp(reg2, type = "lmg")
 sort(relimp2@lmg, decreasing = TRUE)
 
@@ -1101,14 +1435,15 @@ relimp_df <- rbind(data.frame(var = relimp1@namen[2:length(relimp1@namen)],
                               data = "Raw Dispersion", lmg = relimp1@lmg),
                    data.frame(var = relimp2@namen[2:length(relimp2@namen)],
                               data = "Deviation From Null", lmg = relimp2@lmg)) %>%
-  mutate(group = ifelse(grepl("bio.+_mean|elev_mean", var), "habitat", ifelse(grepl("bio.+_var|elev_var", var), "variance", "community"))) %>%
-  arrange(data, group, -lmg)
+  mutate(group = ifelse(grepl("bio.+_mean|elev_mean", var), "habitat",
+                        ifelse(grepl("bio.+_var|elev_var", var), "variance", "community"))) %>%
+  arrange(group, -lmg)
 
-rects <- data.frame(xmin = c(0.5, 7.5, 14.5), xmax = c(7.5, 14.5, 28.5),
-                    ymin = .4, ymax = .7)
+rects <- data.frame(xmin = c(0.5, 7.5), xmax = c(7.5, 20.5),
+                    ymin = 0.2, ymax = 0.25)
 
-texts <- data.frame(x = c(4, 11, 21.5), y = .45,
-                    label = c("Habitat\nVariance", "Habitat\nAverage", "Community"))
+texts <- data.frame(x = c(4, 14), y = 0.225,
+                    label = c("Abiotic\nEnvironment", "Biotic Community"))
 
 # without bootstrap limits
 ggplot(relimp_df, aes(x = var, y = lmg, group = data, fill = data)) +
@@ -1119,7 +1454,7 @@ ggplot(relimp_df, aes(x = var, y = lmg, group = data, fill = data)) +
             fill = "grey90", color = "black", inherit.aes = FALSE) +
   geom_text(data = texts, aes(x = x, y = y, label = label),
             angle = 270, size = 10, inherit.aes = FALSE) +
-  coord_flip(ylim = c(0, 0.5)) +
+  coord_flip(ylim = c(0, 0.25)) +
   scale_x_discrete(name = NULL, labels = sub("\n", " ", labels), expand = expansion(add = 0.5), limits = rev(unique(relimp_df$var))) +
   scale_y_continuous(expression(paste("LMG (Average Partial ", R^2, ")")), expand = c(0,0), breaks = seq(0, 0.4, 0.1)) +
   scale_fill_manual(name = NULL, breaks = c("Raw Dispersion", "Deviation From Null"),
@@ -1130,7 +1465,7 @@ ggplot(relimp_df, aes(x = var, y = lmg, group = data, fill = data)) +
         axis.title.x = element_text(hjust = .3),
         plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
         legend.position="top", legend.margin = margin(0,120,0,0))
-ggsave("Mammal Ranges Relative Importance.pdf", width = 11, height = 14)
+ggsave("Mammal Ranges Relative Importance.pdf", width = 10, height = 14)
 
 #Model Averaging####
 # Get average coefficient estimates for the useful parameters from above
@@ -1142,7 +1477,9 @@ mass_disp_vars <- relimp_df %>%
 
 reg1 <- lm(as.formula(paste0("mass_disp ~ ", paste(mass_disp_vars, collapse = " + "))),
            data = grid_data_sub_clean, na.action = "na.fail")
-drg1 <- dredge(reg1, beta = "sd", trace = 2)
+# standardize coefficients by partial sd to account for intercorrelation of variables
+# https://search.r-project.org/CRAN/refmans/MuMIn/html/std.coef.html
+drg1 <- dredge(reg1, beta = "partial.sd", trace = 2)
 models1 <- model.avg(drg1)
 coef1 <- coefTable(models1)
 cis1 <- confint(models1)
@@ -1155,8 +1492,10 @@ mean_diff_vars <- relimp_df %>%
   pull(var)
 
 reg2 <- lm(as.formula(paste0("mean_diff ~ ", paste(mean_diff_vars, collapse = " + "))),
-           data = grid_data_sub_cont_clean, weights = 1/var_diff, na.action = "na.fail")
-drg2 <- dredge(reg2, beta = "sd", trace = 2)
+           data = grid_data_sub_cont2_clean, weights = 1/var_diff, na.action = "na.fail")
+# standardize coefficients by partial sd to account for intercorrelation of variables
+# https://search.r-project.org/CRAN/refmans/MuMIn/html/std.coef.html
+drg2 <- dredge(reg2, beta = "partial.sd", trace = 2)
 models2 <- model.avg(drg2)
 coef2 <- coefTable(models2)
 cis2 <- confint(models2)
@@ -1169,7 +1508,7 @@ mod_avg_coefs_all <- subset(mod_avg_coefs_all, term != "(Intercept)")
 
 ## Figure 7 ####
 mod_avg_coefs_all$term <- factor(mod_avg_coefs_all$term,
-                                 levels = rev(unique(c(grep("continent", mod_avg_coefs_all$term, value = TRUE), "n",
+                                 levels = rev(unique(c(grep("continent", mod_avg_coefs_all$term, value = TRUE), "n", "n_xl_xxl",
                                                        grep("mass", mod_avg_coefs_all$term, value = TRUE), "psmall", "pmed", "plarge",
                                                        grep("plant", mod_avg_coefs_all$term, value = TRUE), "pherb", "pomni", "pcarn",
                                                        grep("range", mod_avg_coefs_all$term, value = TRUE),"footprint.2009", "deforestation",
@@ -1177,11 +1516,11 @@ mod_avg_coefs_all$term <- factor(mod_avg_coefs_all$term,
                                                        "elev_var", str_sort(grep("bio.+_var", mod_avg_coefs_all$term, value = TRUE), numeric = TRUE)
                                  ))))
 
-rects <- data.frame(xmin = c(0.5, 5.5, 14.5), xmax = c(5.5, 14.5, 19.5),
-                    ymin = 1.45, ymax = 2.8)
+rects <- data.frame(xmin = c(0.5, 7.5, 18.5), xmax = c(7.5, 18.5, 23.5),
+                    ymin = 0.07, ymax = 0.11)
 
-texts <- data.frame(x = c(3, 10, 17), y = 1.85,
-                    label = c("Habitat\nAverage", "Community", "Continent"))
+texts <- data.frame(x = c(4, 13, 21), y = 0.09,
+                    label = c("Abiotic\nEnvironment", "Biotic Community", "Continent"))
 
 ggplot(data = mod_avg_coefs_all, aes(x = term, group = data, fill = data)) +
   geom_vline(xintercept = seq(1.5, 22.5, 1), color = 'grey90') +
@@ -1192,10 +1531,10 @@ ggplot(data = mod_avg_coefs_all, aes(x = term, group = data, fill = data)) +
             fill = "grey90", color = "black", inherit.aes = FALSE) +
   geom_text(data = texts, aes(x = x, y = y, label = label),
             angle = 270, size = 10, inherit.aes = FALSE) +
-  coord_flip(ylim = c(-1.25,2)) +
+  coord_flip(ylim = c(-0.07, 0.11)) +
   scale_x_discrete(name = NULL, labels = sub("\n", " ", labels), expand = expansion(add = 0.5),
                    limits = rev(names(labels)[names(labels) %in% mod_avg_coefs_all$term])) +
-  scale_y_continuous(name = "Model-Averaged Coefficient Estimate", breaks = seq(-1, 1, 1)) +
+  scale_y_continuous(name = "Model-Averaged Coefficient Estimate", expand = c(0,0), breaks = seq(-0.05, 0.05, 0.05)) +
   theme_classic(base_size = 24) +
   theme(axis.ticks = element_line(color = "black"), axis.ticks.y = element_blank(),
         axis.line = element_blank(), axis.text = element_text(colour = "black"),
@@ -1207,10 +1546,284 @@ ggplot(data = mod_avg_coefs_all, aes(x = term, group = data, fill = data)) +
   scale_color_manual(name = NULL, breaks = c("FALSE", "TRUE"), values = c("black", "grey60"), guide = "none")
 ggsave("Mammal Ranges Dredge.pdf", width = 10, height = 14)
 
+# Spatial autocorrelation ####
+# adapted from https://strimas.com/ebp-workshop/subsampling.html
+grid_data_nb <- poly2nb(grid_data_sub_clean$polygon, queen=TRUE)
+grid_data_nblist <- nb2listw(grid_data_nb, zero.policy = TRUE)
+lm.morantest(reg1, grid_data_nblist) # 0.64
+lm.morantest(reg2, grid_data_nblist) # 0.58
+
+dggs2 <- dgconstruct(res = 3)
+grid_data_sub_clean$seqnum_big <- dgGEO_to_SEQNUM(dggs2, grid_data_sub_clean$X, grid_data_sub_clean$Y)$seqnum
+grid2 <- st_wrap_dateline(dgearthgrid(dggs2))
+grid2$centroid <- st_centroid(grid2)$geometry
+grid2_keep <- grid2[sort(unique(grid_data_sub_clean$seqnum_big)), ]
+table(table(grid_data_sub_clean$seqnum_big))
+median(table(grid_data_sub_clean$seqnum_big))
+
+# plot example of spatial subsampling process
+ggplot() +
+  geom_sf(data = land, fill = colland) +
+  geom_sf(data = st_graticule(crs = "+proj=robin", lon = seq(-180, 180, 30),
+                              lat = seq(-90, 90, 30)), color = "gray70") +
+  geom_sf(data = robin_without, fill = "white", color = NA) +
+  geom_sf(data = robin_outline, fill = NA, color = "gray30", size = 0.5/.pt) +
+  geom_sf(data = grid_data_sub_clean, aes(geometry = polygon_robin), fill = NA, color = "grey60") +
+  geom_sf(data = grid_data_sub_clean %>% group_by(seqnum_big) %>% sample_n(size = 1),
+          aes(geometry = polygon_robin), fill = "black", color = "grey60") +
+  geom_sf(data = st_wrap_dateline(grid2_keep, options= c('WRAPDATELINE=YES', 'DATELINEOFFSET=80')),
+          color = "grey20", fill = NA) +
+  coord_sf(crs = "+proj=robin", expand = FALSE) +
+  theme_bw() +
+  theme(axis.text = element_text(color = "black")) +
+  theme(panel.background = element_rect(fill = colsea, color = "white", linewidth = 1),
+        panel.grid.major = element_blank(), plot.margin = unit(c(0, 0, 0, 0), "cm"),
+        panel.border = element_blank())
+ggsave("Mammal Ranges Spatial Subsampling Example.pdf", width = 20, height = 10)
+
+## Relative importance####
+num_sim <- 100
+reg1_keep <- list()
+reg1_moran <- list()
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  grid_data_sub_clean_keep <- grid_data_sub_clean %>%
+    group_by(seqnum_big) %>%
+    sample_n(size = 1) %>%
+    ungroup()
+  grid_data_sub_clean_keep$polygon_big <- grid2_keep$geometry
+  grid_data_keep_nb <- poly2nb(grid_data_sub_clean_keep$polygon_big, queen=TRUE)
+  grid_data_keep_nblist <- nb2listw(grid_data_keep_nb, zero.policy = TRUE)
+  reg1_keep[[i]] <- lm(mass_disp ~ n + n_xl_xxl + pcarn + pherb + plant_disp + mean_plant + mean_range + range_disp +
+                         continent + footprint.2009 + deforestation +
+                         bio1_mean + bio4_mean + bio5_mean + bio6_mean + bio12_mean + bio15_mean + elev_mean,
+                       #    s(Y, X, bs="sos", k=60),
+                       #   bio1_var + bio4_var + bio5_var + bio6_var +
+                       #   bio12_var + bio15_var + elev_var,
+                       data = grid_data_sub_clean_keep, na.action = "na.omit")
+  reg1_moran[[i]] <- lm.morantest(reg1_keep[[i]], grid_data_keep_nblist)
+}
+close(pb)
+
+summary(sapply(reg1_moran, function(item) item$estimate[1]))
+
+cl <- makeCluster(10)
+capture.output(clusterEvalQ(cl, library(relaimpo)), file = nullfile())
+spat_sub_sim1 <- parSapply(cl, reg1_keep, function(lst_item) calc.relimp(lst_item, type = "lmg")@lmg) %>%
+  as.data.frame()
+stopCluster(cl)
+spat_sub_sim1$min <- apply(spat_sub_sim1[, 1:num_sim], 1, min)
+spat_sub_sim1$max <- apply(spat_sub_sim1[, 1:num_sim], 1, max)
+spat_sub_sim1$mean <- apply(spat_sub_sim1[, 1:num_sim], 1, mean)
+
+grid_data_sub_cont2_clean$seqnum_big <- dgGEO_to_SEQNUM(dggs2, grid_data_sub_cont2_clean$X,
+                                                        grid_data_sub_cont2_clean$Y)$seqnum
+reg2_keep <- list()
+reg2_moran <- list()
+pb <- txtProgressBar(min = 0, max = num_sim, style = 3)
+for(i in 1:num_sim){
+  setTxtProgressBar(pb, i)
+  grid_data_sub_cont2_clean_keep <- grid_data_sub_cont2_clean %>%
+    group_by(seqnum_big) %>%
+    sample_n(size = 1) %>%
+    ungroup()
+  grid_data_sub_cont2_clean_keep$polygon_big <- grid2_keep$geometry
+  grid_data_keep_nb <- poly2nb(grid_data_sub_cont2_clean_keep$polygon_big, queen=TRUE)
+  grid_data_keep_nblist <- nb2listw(grid_data_keep_nb, zero.policy = TRUE)
+  reg2_keep[[i]] <- lm(mean_diff ~ n + n_xl_xxl + psmall + plarge + pcarn + pherb +
+                         plant_disp + mean_plant + mean_range + range_disp + continent + footprint.2009 + deforestation +
+                         bio1_mean + bio4_mean + bio5_mean + bio6_mean + bio12_mean + bio15_mean + elev_mean,
+                       #bio1_var + bio4_var + bio5_var + bio6_var + bio12_var + bio15_var + elev_var,
+                       data = grid_data_sub_cont2_clean_keep, weights = 1/var_diff, na.action = "na.omit")
+  reg2_moran[[i]] <- lm.morantest(reg2_keep[[i]], grid_data_keep_nblist)
+}
+close(pb)
+
+summary(sapply(reg2_moran, function(item) item$estimate[1]))
+
+cl <- makeCluster(10)
+capture.output(clusterEvalQ(cl, library(relaimpo)), file = nullfile())
+spat_sub_sim2 <- parSapply(cl, reg2_keep, function(lst_item) calc.relimp(lst_item, type = "lmg")@lmg) %>%
+  as.data.frame()
+stopCluster(cl)
+spat_sub_sim2$min <- apply(spat_sub_sim2[, 1:num_sim], 1, min)
+spat_sub_sim2$max <- apply(spat_sub_sim2[, 1:num_sim], 1, max)
+spat_sub_sim2$mean <- apply(spat_sub_sim2[, 1:num_sim], 1, mean)
+
+### Figure 6 ####
+relimp_df_sub <- rbind(spat_sub_sim1[, c("min", "mean", "max")] %>%
+                     rownames_to_column("var") %>%
+                     mutate(data = "Raw Dispersion"),
+                   spat_sub_sim2[, c("min", "mean", "max")] %>%
+                     rownames_to_column("var") %>%
+                     mutate(data = "Deviation From Null")) %>%
+  mutate(group = ifelse(grepl("bio.+_mean|elev_mean", var), "habitat",
+                        ifelse(grepl("bio.+_var|elev_var", var), "variance", "community"))) %>%
+  arrange(group, -mean)
+
+rects <- data.frame(xmin = c(0.5, 7.5), xmax = c(7.5, 20.5),
+                    ymin = 0.24, ymax = 0.30)
+
+texts <- data.frame(x = c(4, 14), y = 0.27,
+                    label = c("Abiotic\nEnvironment", "Biotic Community"))
+
+ggplot(relimp_df_sub, aes(x = var, y = mean, group = data, fill = data)) +
+  geom_vline(xintercept = seq(1.5, 30.5, 1), color = 'grey90') +
+  geom_hline(yintercept = 0.01, linetype = 'dashed') +
+  geom_errorbar(aes(ymin = min, ymax = max), width = .6, position = position_dodge(width = .8), linewidth = 1) +
+  geom_point(shape = 21, size = 2.5, position = position_dodge2(width = .8, preserve = "single")) +
+  geom_rect(data = rects, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey90", color = "black", inherit.aes = FALSE) +
+  geom_text(data = texts, aes(x = x, y = y, label = label),
+            angle = 270, size = 10, inherit.aes = FALSE) +
+  coord_flip(ylim = c(0, 0.30)) +
+  scale_x_discrete(name = NULL, labels = sub("\n", " ", labels), expand = expansion(add = 0.5), limits = rev(unique(relimp_df_sub$var))) +
+  scale_y_continuous(expression(paste("LMG (Average Partial ", R^2, ")")), expand = c(0,0), breaks = seq(0, 0.4, 0.1)) +
+  scale_fill_manual(name = NULL, breaks = c("Raw Dispersion", "Deviation From Null"),
+                    values = c("white", "black")) +
+  theme_classic(base_size = 24) +
+  theme(axis.ticks = element_line(color = "black"), axis.ticks.y = element_blank(),
+        axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        axis.title.x = element_text(hjust = .3),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position="top", legend.margin = margin(0,120,0,0))
+ggsave("Mammal Ranges Relative Importance Subsampling.pdf", width = 10, height = 14)
+
+## Model averaging####
+### Observed dispersion ####
+mass_disp_vars_sub <- relimp_df_sub %>%
+  filter(data == "Raw Dispersion", mean > 0.01) %>%
+  arrange(-mean) %>%
+  pull(var)
+
+cl <- makeCluster(10)
+capture.output(clusterEvalQ(cl, {library(MuMIn);library(dplyr)}), file = nullfile())
+clusterExport(cl, c("grid_data_sub_clean", "mass_disp_vars_sub"))
+drg1_keep <- parLapply(cl, 1:num_sim, function(i) {
+  grid_data_sub_clean_keep <- grid_data_sub_clean %>%
+    select(-c(geometry, polygon, polygon_igh, polygon_robin)) %>%
+    group_by(seqnum_big) %>%
+    sample_n(size = 1) %>%
+    ungroup()
+  reg1_keep <- lm(as.formula(paste0("mass_disp ~ ", paste(mass_disp_vars_sub, collapse = " + "))),
+                       data = grid_data_sub_clean_keep, na.action = "na.fail")
+  # standardize coefficients by partial sd to account for intercorrelation of variables
+  # https://search.r-project.org/CRAN/refmans/MuMIn/html/std.coef.html
+  drg_tmp <- dredge(reg1_keep, beta = "partial.sd", trace = 2)
+  models_tmp <- model.avg(drg_tmp)
+  coef_tmp <- coefTable(models_tmp)
+  cis_tmp <- confint(models_tmp)
+  cbind.data.frame(term = rownames(coef_tmp), coef_tmp, lower = cis_tmp[,"2.5 %"], upper = cis_tmp[,"97.5 %"])
+}) %>% bind_rows(.id = "sim")
+stopCluster(cl)
+
+drg1_keep_wtd <- drg1_keep %>%
+  filter(term != "(Intercept)") %>%
+  group_by(term) %>%
+  summarise(wtd_mean = Hmisc::wtd.mean(Estimate, w = 1/`Std. Error`^2, normwt=TRUE),
+            wtd_sd = sqrt(Hmisc::wtd.var(Estimate, weights = 1/`Std. Error`^2, normwt=TRUE))) %>%
+  mutate(lower = wtd_mean - 1.96 * wtd_sd, upper = wtd_mean + 1.96 * wtd_sd)
+
+### Deviation from null ####
+mean_diff_vars_sub <- relimp_df_sub %>%
+  filter(data == "Deviation From Null", mean > 0.01) %>%
+  arrange(-mean) %>%
+  pull(var)
+
+cl <- makeCluster(10)
+capture.output(clusterEvalQ(cl, {library(MuMIn);library(dplyr)}), file = nullfile())
+clusterExport(cl, c("grid_data_sub_cont2_clean", "mean_diff_vars_sub"))
+drg2_keep <- parLapply(cl, 1:num_sim, function(i) {
+  grid_data_sub_cont2_clean_keep <- grid_data_sub_cont2_clean %>%
+    select(-c(geometry, polygon, polygon_igh, polygon_robin)) %>%
+    group_by(seqnum_big) %>%
+    sample_n(size = 1) %>%
+    ungroup()
+  reg2_keep <- lm(as.formula(paste0("mean_diff ~ ", paste(mean_diff_vars_sub, collapse = " + "))),
+                  data = grid_data_sub_cont2_clean_keep, weights = 1/var_diff, na.action = "na.fail")
+  # standardize coefficients by partial sd to account for intercorrelation of variables
+  # https://search.r-project.org/CRAN/refmans/MuMIn/html/std.coef.html
+  drg_tmp <- dredge(reg2_keep, beta = "partial.sd", trace = 2)
+  models_tmp <- model.avg(drg_tmp)
+  coef_tmp <- coefTable(models_tmp)
+  cis_tmp <- confint(models_tmp)
+  cbind.data.frame(term = rownames(coef_tmp), coef_tmp, lower = cis_tmp[,"2.5 %"], upper = cis_tmp[,"97.5 %"])
+}) %>% bind_rows(.id = "sim")
+stopCluster(cl)
+
+drg2_keep_wtd <- drg2_keep %>%
+  filter(term != "(Intercept)") %>%
+  group_by(term) %>%
+  summarise(wtd_mean = Hmisc::wtd.mean(Estimate, w = 1/`Std. Error`^2, normwt=TRUE),
+            wtd_sd = sqrt(Hmisc::wtd.var(Estimate, weights = 1/`Std. Error`^2, normwt=TRUE))) %>%
+  mutate(lower = wtd_mean - 1.96 * wtd_sd, upper = wtd_mean + 1.96 * wtd_sd)
+
+mod_avg_coefs_all_sub <- rbind(cbind(drg1_keep_wtd, data = "Raw Dispersion"),
+                               cbind(drg2_keep_wtd, data = "Deviation From Null"))
+mod_avg_coefs_all_sub$data <- factor(mod_avg_coefs_all_sub$data, levels = c("Raw Dispersion", "Deviation From Null"))
+### Figure 7 ####
+mod_avg_coefs_all_sub$term <- factor(mod_avg_coefs_all_sub$term,
+                                 levels = rev(unique(c(grep("continent", mod_avg_coefs_all_sub$term, value = TRUE), "n", "n_xl_xxl",
+                                                       grep("mass", mod_avg_coefs_all_sub$term, value = TRUE), "psmall", "pmed", "plarge",
+                                                       grep("plant", mod_avg_coefs_all_sub$term, value = TRUE), "pherb", "pomni", "pcarn",
+                                                       grep("range", mod_avg_coefs_all_sub$term, value = TRUE),"footprint.2009", "deforestation",
+                                                       "elev_mean", str_sort(grep("bio.+_mean", mod_avg_coefs_all_sub$term, value = TRUE), numeric = TRUE),
+                                                       "elev_var", str_sort(grep("bio.+_var", mod_avg_coefs_all_sub$term, value = TRUE), numeric = TRUE)
+                                 ))))
+
+rects <- data.frame(xmin = c(0.5, 7.5, 17.5), xmax = c(7.5, 17.5, 22.5),
+                    ymin = 0.08, ymax = 0.12)
+
+texts <- data.frame(x = c(4, 12.5, 20), y = 0.10,
+                    label = c("Abiotic\nEnvironment", "Biotic Community", "Continent"))
+
+ggplot(data = mod_avg_coefs_all_sub, aes(x = term, group = data, fill = data)) +
+  geom_vline(xintercept = seq(1.5, 22.5, 1), color = 'grey90') +
+  geom_hline(yintercept = 0) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, color = lower < 0 & upper > 0), width = .6, linewidth = 1, position = position_dodge2(width = .8, preserve = "single", reverse = TRUE)) +
+  geom_point(aes(y = wtd_mean), shape = 21, size = 2.5, position = position_dodge2(width = .6, preserve = "single", reverse = TRUE)) +
+  geom_rect(data = rects, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey90", color = "black", inherit.aes = FALSE) +
+  geom_text(data = texts, aes(x = x, y = y, label = label),
+            angle = 270, size = 10, inherit.aes = FALSE) +
+  coord_flip(ylim = c(-0.07, 0.12)) +
+  scale_x_discrete(name = NULL, labels = sub("\n", " ", labels), expand = expansion(add = 0.5),
+                   limits = rev(names(labels)[names(labels) %in% mod_avg_coefs_all_sub$term])) +
+  scale_y_continuous(name = "Model-Averaged Coefficient Estimate", expand = c(0,0), breaks = seq(-0.05, 0.05, 0.05)) +
+  theme_classic(base_size = 24) +
+  theme(axis.ticks = element_line(color = "black"), axis.ticks.y = element_blank(),
+        axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        axis.title.x = element_text(hjust = -.6),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position="top", legend.margin = margin(0,110,0,0)) +
+  scale_fill_manual(name = NULL, breaks = c("Raw Dispersion", "Deviation From Null"),
+                    values = c("white", "black")) +
+  scale_color_manual(name = NULL, breaks = c("FALSE", "TRUE"), values = c("black", "grey60"), guide = "none")
+ggsave("Mammal Ranges Dredge Subsampling.pdf", width = 10, height = 14)
+
+# ecosystem engineering? ####
+## Figure 8 ####
+#xl/xxl species vs null deviation
+ggplot(grid_data_sub_cont2_clean, aes(x = n_xl_xxl, y = mean_diff)) +
+  geom_violin(aes(group = n_xl_xxl)) +
+  geom_quantile(quantiles = c(0.1, 0.5, 0.9), color = "black", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(breaks = 0:20) +
+  coord_cartesian(xlim = c(0,16)) +
+  xlab("# of Species > 100 kg") +
+  ylab(expression("Deviation from the Null (log"[10]*"g)")) +
+  theme_classic(base_size = 24) +
+  theme(axis.ticks = element_line(color = "black"), axis.ticks.y.right = element_blank(),
+        axis.line = element_blank(), axis.text = element_text(colour = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"), panel.border = element_rect(fill = NA),
+        legend.position=c(.5,.95), legend.margin = margin(0,0,0,0),
+        legend.direction = "horizontal")
+ggsave("Mammal Ranges Ecosystem Engineering.pdf", width = 10, height = 10)
+
 # plarge vs humans ####
 ## Figure 8 ####
 #plarge vs footprint.2009
-ggplot(grid_data_sub_cont_clean, aes(x = footprint.2009, y = plarge, color = continent)) +
+ggplot(grid_data_sub_cont2_clean, aes(x = footprint.2009, y = plarge, color = continent)) +
   geom_point(size = 2) +
   geom_quantile(quantiles = c(0.1, 0.5, 0.9), color = "black", linetype = "dashed", linewidth = 1) +
   scale_color_manual(NULL, values = unname(palette.colors()), guide = guide_legend(override.aes = list(size = 3))) +

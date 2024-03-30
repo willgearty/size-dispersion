@@ -1,5 +1,5 @@
 This repository contains the required R code and data files to produce all of the analyses and plots in:  
-‘Human impacts are indirectly associated with mammal body size homogenization among communities’  
+‘Investigating the biotic and abiotic drivers of body size disparity in communities of non-volant terrestrial mammals’  
 William Gearty, Lawrence H. Uricchio, and S. Kathleen Lyons
 
 ## Before running the code
@@ -16,37 +16,30 @@ dggridR
 ggforce  
 ggtern  
 grid  
-maptools (will be retired in 2023)  
+maptools (was retired in 2023; still available on R-Forge)  
 moments  
 MuMIn  
+parallel  
 patchwork  
 quantreg  
 relaimpo  
-reproj  
 rgbif  
 sf  
 spData  
+spDep  
 stringr  
 terra  
 tidyverse  
 viridis  
 
-The dggridR package is currently only available on GitHub and will need to be installed from there to reproduce
-these analyses and plots. This can be achieved by running the following commands in your R console (ignore the first line 
-if you already have devtools installed).  
-```r
-install.packages("devtools")  
-devtools::install_github("r-barnes/dggridR")
-```
-
   
-All other packages can be installed from CRAN. These scripts have been tested using R version 4.3.1 - 
-Copyright (C) 2023 The R Foundation for Statistical Computing.
+These scripts have been tested using R version 4.3.3 - 
+Copyright (C) 2024 The R Foundation for Statistical Computing.
 
 ## Data
 The IUCN range maps for terrestrial mammals are too large (~1GB total) to include in this repository. They should be downloaded from the IUCN here: https://www.iucnredlist.org/resources/spatial-data-download. Once downloaded, the files should be unzipped and placed into a into a folder named "MAMMALS_TERRESTRIAL_ONLY".
 
-Taxonomy (taxonomy.csv) and synonym (synonyms.csv) files are included for IUCN terrestrial mammals (accessed 11/16/2022), but these may need to be updated from the IUCN website: https://www.iucnredlist.org/search.
+Taxonomy (taxonomy.csv) and synonym (synonyms.csv) files are included for IUCN terrestrial mammals (accessed 02/11/2024), but these may need to be updated from the IUCN website: https://www.iucnredlist.org/search?dl=true&permalink=6da36cdc-5f19-46e7-b980-aeb06b2b6208.
 
 The EltonTraits database contains species-level foraging attributes for mammals (and birds) and is copied from figshare here: https://doi.org/10.6084/m9.figshare.c.3306933.v1. The publication describing this database is available here: https://esajournals.onlinelibrary.wiley.com/doi/abs/10.1890/13-1917.1.
 
